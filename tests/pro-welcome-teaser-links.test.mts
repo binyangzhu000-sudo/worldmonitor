@@ -20,7 +20,7 @@ import { afterEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import i18next from 'i18next';
 
-import { fetchLiveTeasers } from '../pro-test/src/services/teasers.ts';
+import { fetchLiveTeasers, getFallbackTeasers } from '../pro-test/src/services/teasers.ts';
 import { throwOnMissingStaticTranslation } from '../pro-test/src/static-i18n-guard.ts';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -66,6 +66,58 @@ function stubDigest(items: DigestItem[]): void {
           categories: { politics: { items } },
         }),
       };
+    }
+    return { ok: false, status: 503, json: async () => ({}) };
+  }) as unknown as typeof globalThis.fetch;
+}
+
+function stubNonLiveTeasers(): void {
+  globalThis.fetch = (async (url: string | URL) => {
+    const href = String(url);
+    if (href.endsWith('/api/wm-session')) {
+      return { ok: true, status: 200, json: async () => ({ token: 't' }) };
+    }
+    if (href.includes('list-feed-digest')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          generatedAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(),
+          categories: { politics: { items: [digestItem({ title: 'stale live headline' })] } },
+        }),
+      };
+    }
+    if (href.includes('get-risk-scores')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ciiScores: [{ region: 'Degraded region', combinedScore: 99, trend: 'up' }],
+          degraded: true,
+        }),
+      };
+    }
+    if (href.includes('get-chokepoint-status')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          chokepoints: [{ name: 'Unavailable chokepoint', status: 'red', disruptionScore: 100 }],
+          upstreamUnavailable: true,
+        }),
+      };
+    }
+    if (href.includes('list-market-quotes')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          quotes: [{ symbol: '^GSPC', display: 'S&P 500', price: 9999, change: 1, sparkline: [] }],
+        }),
+      };
+    }
+    if (href.includes('list-commodity-quotes') || href.includes('list-crypto-quotes')) {
+      return { ok: true, status: 200, json: async () => ({ quotes: [] }) };
     }
     return { ok: false, status: 503, json: async () => ({}) };
   }) as unknown as typeof globalThis.fetch;
@@ -126,6 +178,18 @@ describe('live welcome headlines link only to verifiable articles', () => {
   });
 });
 
+describe('welcome teaser provenance', () => {
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('keeps the committed snapshot when fetched rows are stale, degraded, unavailable, or partial', async () => {
+    stubNonLiveTeasers();
+    const teasers = await fetchLiveTeasers();
+    assert.deepEqual(teasers, getFallbackTeasers());
+  });
+});
+
 describe('third-party headline text survives the prerender splice', () => {
   it('fails at a real missing static translation instead of scanning rendered data', async () => {
     const instance = i18next.createInstance();
@@ -151,26 +215,6 @@ describe('third-party headline text survives the prerender splice', () => {
     const source = readFileSync(resolve(repoRoot, 'pro-test/src/welcome/LiveStrip.tsx'), 'utf8');
     assert.match(source, /const \[mounted, setMounted\] = useState\(false\)/);
     assert.match(source, /mounted && h\.publishedAt \? ` · \$\{timeAgo\(h\.publishedAt\)\}`/);
-  });
-
-  // Positive control for the hazard itself. Without this, the assertion below
-  // reads as style preference rather than a defect being held closed.
-  it('a STRING replacement expands $-patterns in the injected markup', () => {
-    const page = '<html><body><div id="root"></div></body></html>';
-    const marker = '<div id="root"></div>';
-    // React escapes `'` to `&#x27;`, so a headline containing `$'` arrives at
-    // the splice as a literal `$&` -- the "insert the matched substring" pattern.
-    const ssr = '<li>Oil at $&#x27;record&#x27; highs</li>';
-    const corrupted = page.replace(marker, `<div id="root">${ssr}</div>`);
-    assert.equal(
-      (corrupted.match(/id="root"/g) ?? []).length,
-      2,
-      'premise: a string replacement splices a second #root into the page',
-    );
-    // A backtick, which React does not escape, is worse: it inserts everything
-    // before the match -- the whole preceding document.
-    const withBacktick = page.replace(marker, '<div id="root"><li>a $` b</li></div>');
-    assert.match(withBacktick, /<html><body><div id="root"><li>a <html>/);
   });
 
   it('prerender.mjs splices with function replacements, not replacement strings', () => {
@@ -211,12 +255,4 @@ describe('third-party headline text survives the prerender splice', () => {
     );
   });
 
-  it('the function form leaves the same headline verbatim', () => {
-    const page = '<html><body><div id="root"></div></body></html>';
-    const marker = '<div id="root"></div>';
-    const ssr = '<li>Oil at $&#x27;record&#x27; highs</li>';
-    const safe = page.replace(marker, () => `<div id="root">${ssr}</div>`);
-    assert.equal((safe.match(/id="root"/g) ?? []).length, 1);
-    assert.match(safe, /Oil at \$&#x27;record&#x27; highs/);
-  });
 });

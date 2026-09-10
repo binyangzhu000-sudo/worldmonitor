@@ -5,8 +5,10 @@ import { describe, it } from 'node:test';
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
 const BRAND_PAGE = 'public/world-monitor.md';
-const BRAND_URL = 'https://worldmonitor.app/world-monitor.md';
-const WWW_BRAND_URL = 'https://www.worldmonitor.app/world-monitor.md';
+// One host, not two: /world-monitor.md is not on the Cloudflare apex-exemption
+// list, so the api-catalog and the sitemap must both name www or a crawler
+// following the catalog pays for a 301 the sitemap does not (#7660).
+const BRAND_URL = 'https://www.worldmonitor.app/world-monitor.md';
 
 function organizationBlocks(html) {
   return [...html.matchAll(/<script type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g)]
@@ -17,7 +19,7 @@ function organizationBlocks(html) {
 describe('World Monitor brand-identity page', () => {
   it('opens with the brand-named H1 and a NAP table crawlers can quote', () => {
     const body = read(BRAND_PAGE);
-    assert.ok(body.startsWith('# World Monitor\n'), 'world-monitor.md must open with "# World Monitor"');
+    assert.match(body, /^---\n[\s\S]*?\n---\n+# World Monitor\n/, 'world-monitor.md must retain its brand H1 after metadata');
     assert.match(body, /## Official identity \(NAP\)/);
     assert.match(body, /\|\s*Name\s*\|\s*World Monitor\s*\|/);
     assert.match(body, /https:\/\/www\.worldmonitor\.app/);
@@ -71,7 +73,7 @@ describe('World Monitor brand-identity page', () => {
     }
 
     const sitemap = read('public/sitemap-main.xml');
-    assert.ok(sitemap.includes(`<loc>${WWW_BRAND_URL}</loc>`), 'sitemap-main.xml must register the www brand page');
+    assert.ok(sitemap.includes(`<loc>${BRAND_URL}</loc>`), 'sitemap-main.xml must register the www brand page');
   });
 });
 

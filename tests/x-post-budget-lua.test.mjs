@@ -8,6 +8,7 @@ import {
   STATUS_LUA,
   createXPostBudget,
 } from '../scripts/lib/x-post-budget.cjs';
+import { pollXFeed } from '../scripts/lib/x-news-accounts.cjs';
 
 const DAY_KEY = 'intelligence:x-post-budget:v1:day:2026-09-02';
 const MONTH_KEY = 'intelligence:x-post-budget:v1:month:2026-09';
@@ -358,6 +359,79 @@ describe('X Post budget Lua, executed', () => {
     assert.equal(redis.store.get(COVERAGE_HOLD_KEY), '500');
   });
 
+  it('migrates a lower same-day fixed-slots model without reclaiming spent Posts', () => {
+    const redis = makeRedis({
+      [DAY_KEY]: 5,
+      [MONTH_KEY]: 105,
+      [COVERAGE_HOLD_KEY]: 592,
+      [COVERAGE_MODEL_KEY]: 'fixed-slots-v1:597',
+    });
+    const returned = runScript(
+      RESERVE_LUA,
+      budgetKeys('reservation:new-model', 'coverage:new-model'),
+      reserveArgs(5, 505, 5, false, true),
+      redis,
+      6,
+    );
+    assert.deepEqual(returned, [1, 10, 110, 0, 495, '']);
+    assert.equal(redis.store.get(DAY_KEY), '10');
+    assert.equal(redis.store.get(MONTH_KEY), '110');
+    assert.equal(redis.store.get(COVERAGE_HOLD_KEY), '495');
+    assert.equal(redis.store.get(COVERAGE_MODEL_KEY), 'fixed-slots-v1:505');
+
+    const second = runScript(
+      RESERVE_LUA,
+      budgetKeys(
+        'reservation:second-poller',
+        'coverage:second-poller',
+        'receipt:second-poller',
+        'inflight:second-poller',
+      ),
+      reserveArgs(5, 505, 5, false, true),
+      redis,
+      6,
+    );
+    assert.deepEqual(second, [1, 15, 115, 0, 490, '']);
+    assert.equal(redis.store.get(COVERAGE_HOLD_KEY), '490');
+    assert.equal(redis.store.get(COVERAGE_MODEL_KEY), 'fixed-slots-v1:505');
+  });
+
+  it('rejects unsafe coverage states without changing Redis', () => {
+    const cases = [
+      ['upward model', 495, 'fixed-slots-v1:500'],
+      ['cross-version model', 592, 'fixed-slots-v2:597'],
+      ['malformed model', 592, 'not-a-model'],
+      ['hold without model', 592, undefined],
+      ['model without hold', undefined, 'fixed-slots-v1:597'],
+      ['noncanonical model', 592, 'fixed-slots-v1:0597'],
+      ['noncanonical hold', '0592', 'fixed-slots-v1:597'],
+      ['negative hold', -1, 'fixed-slots-v1:597'],
+      ['fractional hold', 592.5, 'fixed-slots-v1:597'],
+      ['hold over stored total', 598, 'fixed-slots-v1:597'],
+      ['spent Posts over new total', 91, 'fixed-slots-v1:597'],
+      ['effective hold below the unit', 96, 'fixed-slots-v1:597'],
+    ];
+
+    for (const [label, hold, model] of cases) {
+      const initial = { [DAY_KEY]: 5, [MONTH_KEY]: 105 };
+      if (hold !== undefined) initial[COVERAGE_HOLD_KEY] = hold;
+      if (model !== undefined) initial[COVERAGE_MODEL_KEY] = model;
+      const redis = makeRedis(initial);
+      const before = [...redis.store];
+      const returned = runScript(
+        RESERVE_LUA,
+        budgetKeys(`reservation:unsafe:${label}`, `coverage:unsafe:${label}`),
+        reserveArgs(5, 505, 5),
+        redis,
+        6,
+      );
+      assert.equal(returned[0], 0, label);
+      assert.equal(returned[3], 6, label);
+      assert.deepEqual([...redis.store], before, label);
+      assert.equal(redis.expirations.size, 0, label);
+    }
+  });
+
   it('reads day and month counters without changing them', () => {
     const redis = makeRedis({ [DAY_KEY]: 25, [MONTH_KEY]: 425 });
     assert.deepEqual(
@@ -372,7 +446,7 @@ describe('X Post budget Lua, executed', () => {
     ]);
   });
 
-  it('reports an unversioned legacy coverage hold to the status caller', () => {
+  it('reports partial coverage state as invalid to current and prior callers', () => {
     const redis = makeRedis({
       [DAY_KEY]: 3,
       [MONTH_KEY]: 103,
@@ -380,7 +454,30 @@ describe('X Post budget Lua, executed', () => {
     });
     assert.deepEqual(
       runScript(STATUS_LUA, [DAY_KEY, MONTH_KEY, COVERAGE_HOLD_KEY, COVERAGE_MODEL_KEY], [], redis, 5),
-      [3, 103, 500, 1, ''],
+      [3, 103, 500, -1, ''],
+    );
+
+    const modelOnlyRedis = makeRedis({
+      [DAY_KEY]: 3,
+      [MONTH_KEY]: 103,
+      [COVERAGE_MODEL_KEY]: 'fixed-slots-v1:505',
+    });
+    assert.deepEqual(
+      runScript(STATUS_LUA, [DAY_KEY, MONTH_KEY, COVERAGE_HOLD_KEY, COVERAGE_MODEL_KEY], [], modelOnlyRedis, 5),
+      [3, 103, 0, -1, 'fixed-slots-v1:505'],
+    );
+  });
+
+  it('reports a malformed coverage hold through the existing status state field', () => {
+    const redis = makeRedis({
+      [DAY_KEY]: 5,
+      [MONTH_KEY]: 105,
+      [COVERAGE_HOLD_KEY]: '592.5',
+      [COVERAGE_MODEL_KEY]: 'fixed-slots-v1:597',
+    });
+    assert.deepEqual(
+      runScript(STATUS_LUA, [DAY_KEY, MONTH_KEY, COVERAGE_HOLD_KEY, COVERAGE_MODEL_KEY], [], redis, 5),
+      [5, 105, 0, -1, 'fixed-slots-v1:597'],
     );
   });
 
@@ -446,6 +543,8 @@ describe('X Post budget Lua, executed', () => {
       [0, 0, 0, 1, 505, ''],
     );
     assert.equal(deniedRedis.store.has('reservation:denied'), false);
+    assert.equal(deniedRedis.store.has(COVERAGE_HOLD_KEY), false);
+    assert.equal(deniedRedis.store.has(COVERAGE_MODEL_KEY), false);
 
     const curated = runScript(
       RESERVE_LUA,
@@ -598,6 +697,52 @@ describe('X Post budget Lua, executed', () => {
 });
 
 describe('X Post budget key scope', () => {
+  it('runs transient List recovery through the real budget Lua without spending future coverage', async () => {
+    for (const scenario of ['recovery', 'persistent', 'transport', 'malformed', 'credits', 'retry-denied']) {
+      const nowMs = Date.parse('2026-09-02T12:00:00.000Z');
+      const redis = makeRedis({}, nowMs);
+      let id = 0;
+      let fetches = 0;
+      const budget = createXPostBudget({
+        now: () => nowMs,
+        idFactory: () => `retry-${++id}`,
+        evalCommand: async (script, keys, args) => runScript(script, keys, args, redis,
+          script === ACK_RECEIPTS_LUA ? null : script === STATUS_LUA ? 5 : 6),
+      });
+      const existing = { id: 'Reuters:7000000000000000001', postId: '7000000000000000001', ts: '2026-09-02T11:00:00Z' };
+      const next = await pollXFeed({
+        accounts: [{ handle: 'Reuters', accountId: '1652541' }],
+        state: { items: [existing] },
+        bearerToken: 'test-only', listId: '1234567890123456789',
+        coverageId: 'list-slot:2026-09-02T12:00:00.000Z',
+        now: () => nowMs, lookupDeletions: false, verifyMembership: false,
+        withReturnedPosts: (request) => budget.withReturnedPosts(request),
+        sleep: async () => {
+          if (scenario === 'retry-denied') redis.store.set(DAY_KEY, '100');
+        },
+        fetchImpl: async () => {
+          fetches += 1;
+          if (scenario === 'transport') throw new Error('socket closed');
+          if (scenario === 'malformed') return new Response('invalid JSON');
+          if (scenario === 'credits') return new Response(null, { status: 402 });
+          if (scenario === 'recovery' && fetches === 2) return Response.json({ meta: { result_count: 0 } });
+          return new Response(null, { status: 503 });
+        },
+      });
+      assert.equal(fetches, ['recovery', 'persistent'].includes(scenario) ? 2 : 1, scenario);
+      assert.equal(next.listAccepted, scenario === 'recovery', scenario);
+      assert.equal(redis.store.get(COVERAGE_HOLD_KEY), '500', 'only the current five-Post slot was consumed');
+      const charged = ['transport', 'malformed'].includes(scenario) ? '5' : scenario === 'retry-denied' ? '100' : '0';
+      assert.equal(redis.store.get(DAY_KEY), charged, scenario);
+      assert.deepEqual(next.items, [existing], 'valid empty pages and failures both retain the timeline');
+      if (scenario === 'retry-denied') assert.equal(next.errorCode, 'X_BUDGET_DEFERRED');
+      if (scenario === 'recovery') {
+        assert.equal(next.providerSuccessAt, nowMs);
+        assert.equal(await budget.ackReceipts(next.receiptAcks), true);
+      }
+    }
+  });
+
   it('makes every consumer share the same UTC day and month counters', async () => {
     let now = Date.parse('2026-09-30T23:59:59.000Z');
     let id = 0;

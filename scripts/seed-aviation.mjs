@@ -24,6 +24,7 @@
  * hosts the /aviationstack live proxy for user-triggered flight lookups.
  */
 
+import { decodeHtmlEntities } from './_html-entities.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -831,7 +832,7 @@ function parseRssItems(xml, sourceName) {
   }
 }
 
-async function seedAviationNews() {
+export async function seedAviationNews() {
   const t0 = Date.now();
   const now = Date.now();
   const cutoff = now - 24 * 60 * 60 * 1000;
@@ -854,7 +855,7 @@ async function seedAviationNews() {
     let publishedAt = 0;
     if (item.pubDate) try { publishedAt = new Date(item.pubDate).getTime(); } catch { /* skip */ }
     if (publishedAt && publishedAt < cutoff) return null;
-    const snippet = (item.description || '').replace(/<[^>]+>/g, '').slice(0, 200);
+    const snippet = decodeHtmlEntities((item.description || '').replace(/<[^>]+>/g, '')).slice(0, 200);
     return {
       id: Buffer.from(item.link).toString('base64').slice(0, 32),
       title: item.title, url: item.link, sourceName: item._source,
@@ -1450,7 +1451,7 @@ export async function reserveAviationStackBudget(count) {
   }
 }
 
-async function fetchIntl() {
+export async function fetchIntl() {
   const result = await seedIntlDelays();
   if (!result.healthy || result.skipped) {
     const why = result.skipped
@@ -1467,6 +1468,24 @@ async function fetchIntl() {
     const err = new Error(`intl unpublishable: ${why}`);
     err.nonRetryable = true;
     throw err;
+  }
+
+  // A globally healthy sweep can miss required China hubs. Retry only those
+  // hubs once before the publish starts the 55-minute gate, never the full
+  // paid sweep. Reserve the extra calls against the same monthly ceiling.
+  const unavailableHubs = CHINA_AVIATIONSTACK_HUBS.filter((hub) => result.coverage.some(
+    (row) => row.iata === hub.iata && ['failed', 'omitted'].includes(row.status),
+  ));
+  if (unavailableHubs.length > 0 && await reserveAviationStackBudget(unavailableHubs.length)) {
+    const retry = await seedIntlDelays({ airports: unavailableHubs });
+    const recovered = new Map(retry.coverage
+      .filter((row) => row.status === 'normal' || row.status === 'disruption')
+      .map((row) => [row.iata, row]));
+    // Keep the original observations and alerts for every other airport. A
+    // failed retry must not manufacture coverage or refresh old timestamps.
+    result.coverage = result.coverage.map((row) => recovered.get(row.iata) ?? row);
+    result.alerts.push(...retry.alerts);
+    console.log(`[Intl] China hub retry: ${recovered.size}/${unavailableHubs.length} recovered`);
   }
   return result;
 }

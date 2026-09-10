@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -87,6 +86,31 @@ describe('docs locale pair + hreflang cluster', () => {
 });
 
 describe('rewriteDocsLocaleHtml', () => {
+  it('pins Mintlify page metadata to the same public docs base', () => {
+    const config = JSON.parse(readFileSync(join(repoRoot, 'docs/docs.json'), 'utf8'));
+    assert.equal(config.seo.metatags.canonical, `${DOCS_PUBLIC_ORIGIN}/docs`);
+  });
+
+  it('replaces missing, relative, foreign and duplicate canonicals in either locale', () => {
+    for (const pathname of ['/docs/country-instability-index', '/docs/zh/country-instability-index']) {
+      for (const links of [
+        '',
+        '<link href="/wm-proxy/docs/about" rel="canonical">',
+        "<link rel='canonical' href='https://copy.example/docs/about'>",
+        '<link rel="canonical" href="https://copy.example/a"><link rel="canonical" href="https://copy.example/b">',
+      ]) {
+        const seed = `<!DOCTYPE html><html><head>${links}<title>CII</title></head><body>CII</body></html>`;
+        const html = rewriteDocsLocaleHtml(seed, pathname);
+        const head = html.match(/<head>([\s\S]*?)<\/head>/)?.[1] ?? '';
+        assert.deepEqual(head.match(/<link\b[^>]*rel="canonical"[^>]*>/g), [
+          `<link rel="canonical" href="${DOCS_PUBLIC_ORIGIN}${pathname}" />`,
+        ]);
+        assert.equal(rewriteDocsLocaleHtml(html, pathname), html, 'rewriting is idempotent');
+        assert.match(html, /<body>CII<\/body>/);
+      }
+    }
+  });
+
   const zhSeed = `<!DOCTYPE html><html lang="en" class="x"><head>
 <meta name="og:locale" content="en_US"/>
 <link rel="canonical" href="https://www.worldmonitor.app/docs/zh/about"/>
@@ -209,7 +233,8 @@ describe('docs entity-graph rewrite (#7459d)', () => {
 <script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":["Article","TechArticle"],"@id":"https://www.worldmonitor.app/docs/about#article","headline":"About World Monitor","dateModified":"2026-08-30T00:00:00Z","publisher":{"@id":"https://www.worldmonitor.app/#organization"}}]}</script>
 </head><body></body></html>`;
 
-  it('attributes the docs Article to the canonical Organization', () => {
+  it('attributes the docs Article to the canonical Organization', async () => {
+    const { DOCS_PAGE_DATES } = await import('../src/config/docs-page-dates.generated.ts');
     const graph = jsonLdBlocks(rewriteDocsLocaleHtml(articleSeed, '/docs/about'))
       .find((block) => Array.isArray(block['@graph']))?.['@graph'] as Record<string, unknown>[];
     const article = graph.find((node) => Array.isArray(node['@type']));
@@ -217,10 +242,7 @@ describe('docs entity-graph rewrite (#7459d)', () => {
     assert.deepEqual(article.author, { '@id': 'https://www.worldmonitor.app/#organization' });
     assert.deepEqual(article.publisher, { '@id': 'https://www.worldmonitor.app/#organization' });
     assert.equal(article.dateModified, '2026-08-30T00:00:00Z');
-    // Not synthesised: no per-page publication date exists in frontmatter,
-    // docs.json, or any manifest, and copying dateModified into it would
-    // assert a date we do not know.
-    assert.equal(article.datePublished, undefined);
+    assert.equal(article.datePublished, DOCS_PAGE_DATES.about.datePublished);
   });
 
   it('attributes a singular TechArticle and never overwrites an existing author', () => {
@@ -269,6 +291,13 @@ describe('docs entity-graph rewrite handles alternate vendor shapes (#7459d)', (
       .map((m) => JSON.parse(m[1].replace(/\\u003c/g, '<')));
 
   const survivingMintlify = (html: string): boolean => JSON.stringify(blocks(html)).includes('Mintlify');
+
+  it('preserves unrelated publishers whose URL only contains the vendor domain', () => {
+    for (const url of ['https://notmintlify.com', 'https://mintlify.com.example.org', 'https://example.org/mintlify.com']) {
+      const html = rewriteDocsEntityGraph(wrap({ '@type': 'WebSite', '@id': CANONICAL_WEBSITE, creator: { name: 'Other', url } }));
+      assert.ok(html.includes(CANONICAL_WEBSITE), url);
+    }
+  });
 
   it('drops a vendor WebSite inside a top-level array', () => {
     const html = rewriteDocsEntityGraph(wrap([
@@ -374,10 +403,10 @@ describe('docs article injection for bare WebPage output', () => {
     }), '/docs/architecture');
     const article = flatNodes(html).find(isArticle);
     assert.ok(article, 'a bare WebPage must gain an Article node');
-    assert.equal(article?.dateModified, DOCS_PAGE_DATES['architecture']);
+    assert.equal(article?.dateModified, DOCS_PAGE_DATES['architecture'].dateModified);
     assert.deepEqual(article?.publisher, { '@id': ORG_ID });
     assert.deepEqual(article?.author, { '@id': ORG_ID });
-    assert.equal(article?.datePublished, undefined, 'publication dates are never synthesised');
+    assert.equal(article?.datePublished, DOCS_PAGE_DATES['architecture'].datePublished);
   });
 
   it('never invents an article when the slug has no manifest date', () => {
@@ -391,7 +420,7 @@ describe('docs article injection for bare WebPage output', () => {
     assert.equal(flatNodes(html).filter(isArticle).length, 0);
   });
 
-  it('backfills dateModified onto an upstream Article that drops it', async () => {
+  it('backfills both dates onto an upstream Article that drops them', async () => {
     const { DOCS_PAGE_DATES } = await import('../src/config/docs-page-dates.generated.ts');
     const html = rewriteDocsEntityGraph(seed({
       '@context': 'https://schema.org',
@@ -404,8 +433,25 @@ describe('docs article injection for bare WebPage output', () => {
     }), '/docs/about');
     const article = flatNodes(html).find(isArticle);
     assert.ok(article, 'the upstream Article must survive');
-    assert.equal(article?.dateModified, DOCS_PAGE_DATES['about']);
+    assert.equal(article?.dateModified, DOCS_PAGE_DATES['about'].dateModified);
+    assert.equal(article?.datePublished, DOCS_PAGE_DATES['about'].datePublished);
     assert.deepEqual(article?.author, { '@id': ORG_ID });
+  });
+
+  it('preserves upstream dates and leaves unknown slugs untouched', () => {
+    const upstream = {
+      '@context': 'https://schema.org',
+      '@type': 'TechArticle',
+      headline: 'About',
+      datePublished: '2026-01-01',
+      dateModified: '2026-02-01',
+    };
+    const article = flatNodes(rewriteDocsEntityGraph(seed(upstream), '/docs/about')).find(isArticle);
+    assert.equal(article?.datePublished, upstream.datePublished);
+    assert.equal(article?.dateModified, upstream.dateModified);
+    const unknown = flatNodes(rewriteDocsEntityGraph(seed({ '@type': 'Article', headline: 'Unknown' }), '/docs/no-such-page')).find(isArticle);
+    assert.equal(unknown?.datePublished, undefined);
+    assert.equal(unknown?.dateModified, undefined);
   });
 
   it('does not inject a second Article when another JSON-LD script already has one', async () => {
@@ -429,7 +475,8 @@ describe('docs article injection for bare WebPage output', () => {
     const articles = nodes.filter(isArticle);
 
     assert.equal(articles.length, 1, 'the complete document must contain at most one Article');
-    assert.equal(articles[0]?.dateModified, DOCS_PAGE_DATES.about);
+    assert.equal(articles[0]?.dateModified, DOCS_PAGE_DATES.about.dateModified);
+    assert.equal(articles[0]?.datePublished, DOCS_PAGE_DATES.about.datePublished);
     assert.deepEqual(articles[0]?.author, { '@id': ORG_ID });
     assert.deepEqual(
       nodes.find((node) => node['@type'] === 'WebPage')?.speakable,
@@ -467,10 +514,12 @@ describe('docs article injection for bare WebPage output', () => {
     }), '/docs/zh/about');
     const article = flatNodes(html).find(isArticle);
     assert.ok(article, 'a bare zh WebPage must gain an Article node');
-    assert.equal(article?.dateModified, DOCS_PAGE_DATES['zh/about']);
+    assert.equal(article?.dateModified, DOCS_PAGE_DATES['zh/about'].dateModified);
+    assert.equal(article?.datePublished, DOCS_PAGE_DATES['zh/about'].datePublished);
   });
 
-  it('covers every committed docs slug in the date manifest', async () => {    const { DOCS_PAGE_DATES } = await import('../src/config/docs-page-dates.generated.ts');
+  it('covers every committed docs slug in the date manifest', async () => {
+    const { DOCS_PAGE_DATES } = await import('../src/config/docs-page-dates.generated.ts');
     const slugs: string[] = [];
     const walk = (dir: string, prefix: string) => {
       for (const entry of readdirSync(join(repoRoot, dir), { withFileTypes: true })) {
@@ -480,13 +529,16 @@ describe('docs article injection for bare WebPage output', () => {
     };
     walk('docs', '');
     for (const slug of slugs) {
-      assert.match(
-        DOCS_PAGE_DATES[slug] ?? '',
-        /^\d{4}-\d{2}-\d{2}$/,
-        `date manifest must carry a real date for docs/${slug}.mdx — run npm run docs:dates`,
-      );
+      for (const field of ['datePublished', 'dateModified'] as const) {
+        assert.match(
+          DOCS_PAGE_DATES[slug]?.[field] ?? '',
+          /^\d{4}-\d{2}-\d{2}$/,
+          `date manifest must carry ${field} for docs/${slug}.mdx — run npm run docs:dates`,
+        );
+      }
     }
     for (const slug of Object.keys(DOCS_PAGE_DATES)) {
+      if (slug.startsWith('api-reference/')) continue; // Generated from configured OpenAPI sources.
       assert.equal(
         existsSync(join(repoRoot, `docs/${slug}.mdx`)),
         true,
@@ -494,13 +546,20 @@ describe('docs article injection for bare WebPage output', () => {
       );
     }
   });
+});
 
-  it('keeps the committed date manifest fresh against git history', () => {
-    assert.doesNotThrow(() => {
-      execFileSync(process.execPath, ['scripts/generate-docs-page-dates.mjs', '--check'], {
-        cwd: repoRoot,
-        stdio: 'pipe',
-      });
-    });
-  });
+it('keeps canonical-looking script text intact with alternate closing tags', () => {
+  const script = `<script>const example = '<link rel="canonical" href="https://example.org">';</script foo="bar">`;
+  const html = rewriteDocsLocaleHtml(`<html><head>${script}</head><body></body></html>`, '/docs/about');
+  assert.ok(html.includes(script));
+});
+
+it('preserves closing-head text inside scripts while inserting real head links', () => {
+  for (const prefix of ['', '<link rel="canonical" href="https://old.example">']) {
+    const script = '<script>const closing = "</head>";</script>';
+    const html = rewriteDocsLocaleHtml(`<html><head>${prefix}${script}</head><body></body></html>`, '/docs/about');
+    assert.ok(html.includes(script));
+    assert.equal(html.match(/rel="canonical"/g)?.length, 1);
+    assert.ok(html.includes('hreflang="en"'));
+  }
 });

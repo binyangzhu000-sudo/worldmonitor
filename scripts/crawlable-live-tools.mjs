@@ -203,12 +203,12 @@ export function chokepointEvidenceNarrative({
     : 'Configured geopolitical baseline: no additional threat weight.';
   const observedInputs = [
     warnings,
-    severity ? `maximum AIS severity ${severity}` : null,
-    anomaly ? `transit anomaly — ${anomaly.replace(/[.]+$/, '')}` : null,
+    severity ? `maximum AIS congestion severity ${severity}` : null,
+    anomaly ? `PortWatch daily-transit anomaly: ${anomaly.replace(/[.]+$/, '')}` : null,
   ].filter(Boolean);
   const unavailableInputs = [
     warnings === null ? 'navigational warning count' : null,
-    severity === null ? 'maximum AIS severity' : null,
+    severity === null ? 'maximum AIS congestion severity' : null,
   ].filter(Boolean);
   const observed = observedInputs.length
     ? `Observed score inputs: ${observedInputs.join('; ')}.`
@@ -1454,6 +1454,7 @@ export async function loadHazards(tool) {
       async (signal) => {
         const payload = await requestLiveJson('/api/natural/v1/list-natural-events', {
           signal,
+          preflightSession: true,
         });
         return hazardPulseViewModel(payload, { bounds });
       },

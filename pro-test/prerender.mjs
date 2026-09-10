@@ -182,7 +182,9 @@ async function renderWelcomeRoot() {
   });
   try {
     const { renderWelcomeApp } = await server.ssrLoadModule('/src/welcome-prerender.tsx');
-    return rewriteBuiltAssetUrls(await renderWelcomeApp());
+    const { htmlToMarkdown } = await server.ssrLoadModule('../api/_md-url-twin.ts');
+    const html = rewriteBuiltAssetUrls(await renderWelcomeApp());
+    return { html, markdown: htmlToMarkdown(html, 'World Monitor') };
   } finally {
     await server.close();
   }
@@ -230,11 +232,14 @@ function rewriteBuiltAssetUrls(markup) {
   return rewritten;
 }
 
-const welcomeContent = await renderWelcomeRoot();
+const { html: welcomeContent, markdown: welcomeMarkdown } = await renderWelcomeRoot();
 
 // GitHub star InteractionCounter: populated from the committed freeze
 // snapshot, never hardcoded and never fetched at build time (offline builds
-// stay deterministic). Refresh via `npm run freeze:github-stars`.
+// stay deterministic). Refresh via `npm run freeze:github-stars` (monthly via
+// .github/workflows/github-stars-refresh.yml); the lookup rejects snapshots
+// older than MAX_GITHUB_STARS_SNAPSHOT_AGE_DAYS, so a stale freeze reds the
+// build instead of publishing a rotting figure.
 // Pages whose committed template carries a #software node must leave the
 // build with the counter injected — a missing node is a dropped counter,
 // not an optional page.
@@ -292,3 +297,16 @@ for (const { file, content, rootAttributes } of PAGES) {
   writeFileSync(htmlPath, html, 'utf-8');
   console.log(`[prerender] Injected critical CSS and visible content into public/pro/${file}`);
 }
+
+// Both homepage markdown selectors use the rendered HTML's content. Keep the
+// curated authentication and discovery guidance as a supplement, not a second
+// independently maintained copy of the homepage's measured statistics.
+const agentContext = readFileSync(resolve(__dirname, '../public/home.md'), 'utf8');
+const metadata = agentContext.match(/^---\n[\s\S]*?\n---\n/);
+if (!metadata) throw new Error('Homepage agent context must have document metadata');
+const supplement = agentContext.slice(metadata[0].length).trim().replace(/^# .+\n+/, '');
+writeFileSync(
+  resolve(__dirname, '../public/pro/home.md'),
+  `${metadata[0].replace('https://www.worldmonitor.app/home.md', 'https://www.worldmonitor.app/')}\n${welcomeMarkdown}\n\n${supplement}\n`,
+  'utf8',
+);

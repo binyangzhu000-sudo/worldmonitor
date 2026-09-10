@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 const { parseProxyConfig, resolveProxyString, resolveProxyStringForAttempt } = require('./_proxy-utils.cjs');
+const { parseWidgetAgentResponse } = require('./_widget-response-parser.cjs');
 const {
   cooldownKeyForAccount,
   OPENSKY_LEGACY_COOLDOWN_KEY,
@@ -6117,10 +6118,16 @@ async function seedWeatherAlerts() {
       maxBytes: SWIC_MAX_BYTES,
     });
 
+    const sourceSuccessAt = {};
+    const fetchSource = async (source, fetchFn) => {
+      const value = await fetchFn();
+      sourceSuccessAt[source] = Date.now();
+      return value;
+    };
     const [nwsResult, ecccResult, swicResult] = await Promise.allSettled([
-      fetchNwsFeatures(),
-      fetchEcccFeatures(),
-      fetchSwicCatalog(),
+      fetchSource('nws', fetchNwsFeatures),
+      fetchSource('eccc', fetchEcccFeatures),
+      fetchSource('swic', fetchSwicCatalog),
     ]);
     if (nwsResult.status === 'rejected') {
       console.warn(`[Weather] NWS fetch failed: ${nwsResult.reason?.message || nwsResult.reason}`);
@@ -6131,10 +6138,9 @@ async function seedWeatherAlerts() {
     if (swicResult.status === 'rejected') {
       console.warn(`[Weather] SWIC fetch failed: ${swicResult.reason?.message || swicResult.reason}`);
     }
-    if (nwsResult.status === 'rejected' && ecccResult.status === 'rejected' && swicResult.status === 'rejected') {
-      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
-      return;
-    }
+    const results = { nws: nwsResult, eccc: ecccResult, swic: swicResult };
+    const failedSources = Object.keys(results).filter((source) => results[source].status === 'rejected');
+    const attemptedAt = Date.now();
 
     const nwsFeatures = nwsResult.status === 'fulfilled' ? nwsResult.value : [];
     const nwsAlerts = nwsResult.status === 'fulfilled'
@@ -6157,9 +6163,21 @@ async function seedWeatherAlerts() {
     let carriedNws = [];
     let carriedEccc = [];
     let carriedSwic = [];
-    if (nwsResult.status === 'rejected' || ecccResult.status === 'rejected' || swicResult.status === 'rejected') {
-      const prev = await envelopeRead(WEATHER_REDIS_KEY, () => null);
-      const prevAlerts = Array.isArray(prev?.alerts) ? prev.alerts : [];
+    let previousMeta = null;
+    let previousPayloadAt = null;
+    if (failedSources.length > 0) {
+      const [raw, meta] = await Promise.all([
+        upstashGet(WEATHER_REDIS_KEY, () => null),
+        upstashGet('seed-meta:weather:alerts', () => null),
+      ]);
+      previousMeta = meta;
+      // Inspect the envelope clock as well as its data: the two writes can fail independently.
+      const enveloped = raw && typeof raw === 'object' && !Array.isArray(raw) && '_seed' in raw && 'data' in raw;
+      const prev = enveloped ? raw.data : raw;
+      previousPayloadAt = enveloped ? raw._seed?.fetchedAt : null;
+      // Failed providers cannot tell us which alerts ended since the last fetch.
+      const prevAlerts = (Array.isArray(prev?.alerts) ? prev.alerts : [])
+        .filter((alert) => Date.parse(alert?.expires) > attemptedAt);
       if (nwsResult.status === 'rejected') carriedNws = prevAlerts.filter((a) => a?.source === 'nws');
       if (ecccResult.status === 'rejected') carriedEccc = prevAlerts.filter((a) => a?.source === 'eccc');
       if (swicResult.status === 'rejected') carriedSwic = prevAlerts.filter((a) => a?.source === 'swic');
@@ -6173,32 +6191,55 @@ async function seedWeatherAlerts() {
       eccc: ecccResult.status === 'fulfilled' ? ecccAlerts : carriedEccc,
       swic: swicResult.status === 'fulfilled' ? swicAlerts : carriedSwic,
     });
+    const sourceHealth = Object.fromEntries(Object.keys(results).map((source) => {
+      if (results[source].status === 'fulfilled') {
+        return [source, { lastSuccessAt: sourceSuccessAt[source], consecutiveFailures: 0, firstFailureAt: null, retainedUntil: null }];
+      }
+      const previous = previousMeta?.sourceHealth?.[source];
+      const known = previousMeta?.status !== 'error'
+        && Number.isSafeInteger(previousPayloadAt) && previousPayloadAt > 0
+        && previousPayloadAt === previousMeta?.fetchedAt
+        && Number.isSafeInteger(previous?.consecutiveFailures) && previous.consecutiveFailures >= 0;
+      const retained = alerts.filter((alert) => alert.source === source);
+      return [source, {
+        lastSuccessAt: previous?.lastSuccessAt ?? null,
+        consecutiveFailures: known ? Math.min(previous.consecutiveFailures + 1, 100) : null,
+        firstFailureAt: known && previous.consecutiveFailures === 0 ? attemptedAt : (previous?.firstFailureAt ?? null),
+        retainedUntil: retained.length > 0 ? Math.min(...retained.map((alert) => Date.parse(alert.expires))) : null,
+      }];
+    }));
+    const sourceMeta = {
+      sourceHealth,
+      lastSourceAttemptAt: attemptedAt,
+      ...(failedSources.length > 0
+        ? { sourceState: 'degraded', errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE', failedSources }
+        : { sourceState: 'ok' }),
+    };
+    if (failedSources.length === 3) {
+      await upstashSet('seed-meta:weather:alerts', {
+        fetchedAt: previousMeta?.fetchedAt ?? 0,
+        recordCount: previousMeta?.recordCount ?? 0,
+        ...sourceMeta,
+      }, 604800);
+      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
+      return;
+    }
 
     // Always write the merged active set (#6607 purge). Do not skip overwrite
     // when a live source returns 0 — that would leave ended CA alerts cached.
     const payload = { alerts };
+    const publishedAt = Date.now();
     const ok1 = await envelopeWrite(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL, {
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
       sourceVersion: WEATHER_ALERTS_SOURCE_VERSION,
       zeroOk: true,
     });
-    // A permanently dead source must be visible to /api/health. Without a
-    // sourceState the seed-meta stays fresh forever and the outage is invisible.
-    const failedSources = [
-      nwsResult.status === 'rejected' ? 'nws' : null,
-      ecccResult.status === 'rejected' ? 'eccc' : null,
-      swicResult.status === 'rejected' ? 'swic' : null,
-    ].filter(Boolean);
     const ok2 = await upstashSet('seed-meta:weather:alerts', {
-      fetchedAt: Date.now(),
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
-      ...(failedSources.length > 0
-        ? {
-          sourceState: 'degraded',
-          errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE',
-          failedSources,
-        }
-        : { sourceState: 'ok' }),
+      ...sourceMeta,
+      ...(!ok1 ? { status: 'error' } : {}),
     }, 604800);
     console.log(`[Weather] Seeded ${alerts.length} alerts (nws=${nwsAlerts.length} eccc=${ecccAlerts.length} swic=${swicAlerts.length}, redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     // Which high-severity alerts this tick notifies on. Distinct families,
@@ -6974,8 +7015,9 @@ async function seedCorridorRisk() {
         eventCount7d: Number(corridor.event_count_7d ?? 0),
         disruptionPct: Number(corridor.disruption_pct ?? 0),
         vesselCount: Number(corridor.vessel_count ?? 0),
-        riskSummary: String(corridor.risk_summary || '').slice(0, 200),
-        riskReportAction: String((corridor.risk_report?.action) || '').slice(0, 500),
+        // Generated prose has no verified routing or cost basis.
+        riskSummary: '',
+        riskReportAction: '',
       };
     }
     if (Object.keys(result).length === 0) {
@@ -6992,7 +7034,7 @@ async function seedCorridorRisk() {
       const label = corridorId.replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
       publishNotificationEvent({
         eventType: 'corridor_risk',
-        payload: { title: `${label}: risk score ${c.riskScore}${c.riskSummary ? ' — ' + c.riskSummary.slice(0, 80) : ''}`, source: 'Corridor Risk' },
+        payload: { title: `${label}: risk score ${c.riskScore}`, source: 'Corridor Risk' },
         severity: c.riskScore >= 70 ? 'critical' : 'high',
         variant: undefined,
         dedupTtl: 3600,
@@ -7475,7 +7517,9 @@ async function seedSocialVelocity() {
       for (const p of posts) {
         // Deduplicate cross-subreddit reposts of the same article URL.
         const articleUrl = p.url || '';
-        const isExternal = articleUrl && !articleUrl.includes('reddit.com');
+        let articleHostname = '';
+        try { articleHostname = new URL(articleUrl).hostname; } catch { /* invalid URLs are not deduplicated */ }
+        const isExternal = articleHostname && articleHostname !== 'reddit.com' && !articleHostname.endsWith('.reddit.com');
         if (isExternal && seenUrls.has(articleUrl)) continue;
         if (isExternal) seenUrls.add(articleUrl);
         const ageSec = Math.max(1, nowSec - (p.created_utc || nowSec));
@@ -8783,6 +8827,14 @@ const MAX_VESSEL_META = 50000;
 
 const vessels = new Map();
 const vesselHistory = new Map();
+// mmsi → timestamp of the vessel's most recent position fix. Retention must
+// exceed GAP_THRESHOLD: the dark-ship return check compares the CURRENT fix
+// against this value, and the vesselHistory equivalent loses the prior fix
+// to its 30-minute DENSITY_WINDOW prune and 10-entry cap long before a >1h
+// silence ends. Bounded by the same retention prune + recency eviction
+// cleanupAggregates applies to vesselHistory.
+const vesselLastFixSeen = new Map();
+const LAST_FIX_RETENTION_MS = 6 * 60 * 60 * 1000; // 6h — 6× GAP_THRESHOLD
 const densityGrid = new Map();
 const candidateReports = new Map();
 // Parallel store for tanker (AIS ship type 80-89) position reports — populated
@@ -8846,6 +8898,17 @@ const TRANSIT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_DWELL_MS = 5 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_KEY = 'supply_chain:chokepoint_transits:v1';
 const CHOKEPOINT_TRANSIT_TTL = 3600; // 1h — 6x interval; survives ~5 consecutive missed pings
+
+// Dark-ship (AIS gap) count envelope — the trusted producer behind the
+// temporal anomalies `ais_gaps` count source (#7574). Written on its own
+// slow loop, not on the per-snapshot build: detectDisruptions runs every
+// SNAPSHOT_INTERVAL_MS, which would be a Redis write per relay heartbeat.
+const AIS_GAPS_REDIS_KEY = 'maritime:ais-gaps:v1';
+// 60min — must STRICTLY exceed the 30min health maxStaleMin (api/health.js
+// aisGaps entry) so a dead relay reads warn STALE_SEED before the envelope
+// expires to crit EMPTY; 6x the seed interval.
+const AIS_GAPS_TTL = 3600;
+const AIS_GAPS_SEED_INTERVAL_MS = 10 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_INTERVAL_MS = 10 * 60 * 1000;
 
 const NAVAL_PREFIX_RE = /^(USS|USNS|HMS|HMAS|HMCS|INS|JS|ROKS|TCG|FS|BNS|RFS|PLAN|PLA|CGC|PNS|KRI|ITS|SNS|MMSI)/i;
@@ -9101,6 +9164,18 @@ function processPositionReportForSnapshot(data) {
   });
 
   const history = vesselHistory.get(mmsi) || [];
+  // Dark-ship return detection (#7574): a fix arriving more than
+  // GAP_THRESHOLD after the previous one marks the vessel as returned from
+  // extended AIS silence. The prior fix is read from vesselLastFixSeen, NOT
+  // from vesselHistory — cleanupAggregates prunes vesselHistory to the
+  // 30-min DENSITY_WINDOW and caps it at 10 entries, so by the time a >1h
+  // silence ends the old fix is long gone from that structure and a
+  // history-diffing form of this check can never fire.
+  const lastFixAt = vesselLastFixSeen.get(mmsi);
+  if (lastFixAt && now - lastFixAt > GAP_THRESHOLD) {
+    darkShipReturns.set(mmsi, now);
+  }
+  vesselLastFixSeen.set(mmsi, now);
   history.push(now);
   if (history.length > 10) history.shift();
   vesselHistory.set(mmsi, history);
@@ -9187,6 +9262,14 @@ function cleanupAggregates() {
       vesselHistory.set(mmsi, filtered);
     }
   }
+  // Retention prune + recency cap for the dark-ship last-fix map: entries
+  // older than the retention window can never be part of a live >1h silence
+  // comparison again, and the cap bounds memory against vessel churn.
+  const lastFixCutoff = now - LAST_FIX_RETENTION_MS;
+  for (const [mmsi, ts] of vesselLastFixSeen) {
+    if (ts < lastFixCutoff) vesselLastFixSeen.delete(mmsi);
+  }
+  evictMapByTimestamp(vesselLastFixSeen, MAX_VESSEL_HISTORY, (ts) => ts);
   // Hard cap: keep the most recent vessel histories.
   evictMapByTimestamp(vesselHistory, MAX_VESSEL_HISTORY, (history) => history[history.length - 1] || 0);
 
@@ -9275,6 +9358,29 @@ function cleanupAggregates() {
   }
 }
 
+// Vessels seen again after extended AIS silence: mmsi → the return-seen
+// timestamp. Entries are bounded by the 10-minute freshness window in
+// countDarkShips (pruned on read) and the 10-entry vesselHistory cap, so the
+// map cannot grow unbounded even in a flood of simultaneous returns.
+const darkShipReturns = new Map();
+
+/**
+ * Vessels that returned after extended AIS silence and were seen again
+ * within the last 10 minutes — the signal the retired client-side ais_gaps
+ * baseline counted per browser session (#7574). Sightings are recorded at
+ * ingestion (processPositionReportForSnapshot) because cleanupAggregates
+ * prunes vesselHistory to the 30-minute DENSITY_WINDOW, which can never
+ * span the 1-hour GAP_THRESHOLD.
+ */
+function countDarkShips(now = Date.now()) {
+  let darkShipCount = 0;
+  for (const [mmsi, seenAt] of darkShipReturns) {
+    if (now - seenAt >= 10 * 60 * 1000) darkShipReturns.delete(mmsi);
+    else darkShipCount++;
+  }
+  return darkShipCount;
+}
+
 function detectDisruptions() {
   const disruptions = [];
   const now = Date.now();
@@ -9308,17 +9414,7 @@ function detectDisruptions() {
     }
   }
 
-  let darkShipCount = 0;
-  for (const history of vesselHistory.values()) {
-    if (history.length >= 2) {
-      const lastSeen = history[history.length - 1];
-      const secondLast = history[history.length - 2];
-      if (lastSeen - secondLast > GAP_THRESHOLD && now - lastSeen < 10 * 60 * 1000) {
-        darkShipCount++;
-      }
-    }
-  }
-
+  const darkShipCount = countDarkShips(now);
   if (darkShipCount >= 1) {
     disruptions.push({
       id: 'global-gap-spike',
@@ -9545,6 +9641,39 @@ async function seedChokepointTransits() {
   console.log(`[Transit] Seeded ${Object.keys(transits).length} chokepoint transit counts`);
 }
 
+/**
+ * seedAisGaps publishes the dark-ship count envelope + seed-meta.
+ *
+ * `sampledAt` is the content clock the temporal-anomalies rebuild reads
+ * (gapsContentClock); computing `now` once and threading it through both
+ * writes keeps `_seed.fetchedAt` and seed-meta in agreement (#6775).
+ *
+ * The publish is gated on AIS position freshness: while the aisstream feed
+ * is down or stale the relay cannot observe returns, so publishing a count
+ * (most robusly a zero) would stamp OK on a blind sensor. Skipping BOTH
+ * writes instead lets the 30min health budget age the missing stamp into
+ * STALE_SEED — the honest signal.
+ */
+async function seedAisGaps() {
+  const now = Date.now();
+  if (!getAisPositionFreshness(now).currentPositionReady) {
+    console.log(`[AisGaps] Skipping publish: AIS positions not fresh (ageMs=${getAisPositionFreshness(now).positionAgeMs})`);
+    return;
+  }
+  const darkShips = countDarkShips(now);
+  const envelopeOk = await envelopeWrite(AIS_GAPS_REDIS_KEY, { darkShips, sampledAt: now }, AIS_GAPS_TTL, { fetchedAt: now, recordCount: darkShips, sourceVersion: 'ais-gaps', zeroOk: true });
+  const metaOk = await upstashSet('seed-meta:maritime:ais-gaps', { fetchedAt: now, recordCount: darkShips }, 604800);
+  if (!envelopeOk || !metaOk) {
+    console.warn(`[AisGaps] Seed write FAILED (envelope=${envelopeOk} meta=${metaOk})`);
+    return;
+  }
+  console.log(`[AisGaps] Seeded dark-ship count: ${darkShips}`);
+}
+
+setTimeout(() => {
+  startBootSeedLoop('AisGaps', 'seed-meta:maritime:ais-gaps', AIS_GAPS_SEED_INTERVAL_MS, seedAisGaps, err => console.error('[AisGaps] Initial seed error:', err.message), err => console.error('[AisGaps] Seed error:', err.message));
+}, 30_000);
+
 setTimeout(() => {
   startBootSeedLoop('Transit', 'seed-meta:supply_chain:chokepoint_transits', CHOKEPOINT_TRANSIT_INTERVAL_MS, seedChokepointTransits, err => console.error('[Transit] Initial seed error:', err.message), err => console.error('[Transit] Seed error:', err.message));
 }, 30_000);
@@ -9654,8 +9783,9 @@ async function seedTransitSummaries() {
       riskLevel: cr?.riskLevel ?? '',
       incidentCount7d: cr?.incidentCount7d ?? 0,
       disruptionPct: cr?.disruptionPct ?? 0,
-      riskSummary: cr?.riskSummary ?? '',
-      riskReportAction: cr?.riskReportAction ?? '',
+      // Persisted corridor data can predate prose suppression.
+      riskSummary: '',
+      riskReportAction: '',
       anomaly,
       dataAvailable: Boolean(cpData),
     };
@@ -13605,10 +13735,7 @@ async function handleWidgetAgentRequest(req, res) {
       if (response.stop_reason === 'end_turn') {
         const textBlock = response.content.find(b => b.type === 'text');
         const text = textBlock?.text ?? '';
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        const html = (htmlMatch?.[1] ?? text).slice(0, maxHtml);
-        const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-        const title = titleMatch?.[1]?.trim() ?? 'Custom Widget';
+        const { html, title } = parseWidgetAgentResponse(text, maxHtml);
         sendWidgetSSE(res, 'html_complete', { html });
         sendWidgetSSE(res, 'done', { title });
         completed = true;
@@ -13679,11 +13806,10 @@ async function handleWidgetAgentRequest(req, res) {
         const text = Array.isArray(msg.content)
           ? msg.content.filter(b => b.type === 'text').map(b => b.text).join('')
           : String(msg.content ?? '');
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        if (htmlMatch?.[1]?.trim()) {
-          const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-          sendWidgetSSE(res, 'html_complete', { html: htmlMatch[1].slice(0, maxHtml) });
-          sendWidgetSSE(res, 'done', { title: titleMatch?.[1]?.trim() ?? 'Custom Widget' });
+        const parsed = parseWidgetAgentResponse(text, maxHtml);
+        if (parsed.hasHtmlMarkers && parsed.html.trim()) {
+          sendWidgetSSE(res, 'html_complete', { html: parsed.html });
+          sendWidgetSSE(res, 'done', { title: parsed.title });
           recovered = true;
           break;
         }

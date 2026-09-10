@@ -52,6 +52,7 @@ import { evaluateFreshness } from '../freshness';
 import { budgetCounterKey, isSharedRestCounter, resolveDailyLimit, type McpBudget } from '../quota';
 import { rpcError, rpcOk, withMcpNoStore } from '../rpc';
 import { readJsonFromUpstash } from '../../_upstash-json.js';
+import { isAppOwnedRedisKey } from '../../_redis-key-ownership.js';
 import {
   FREE_ACCOUNT_CALLS_PER_DAY,
   FREE_ACCOUNT_IDLE_GAP_MS,
@@ -76,7 +77,9 @@ import { CHOKEPOINT_SLUGS } from './slugs';
 const MARKET_FRESHNESS_CHECK = { key: 'seed-meta:market:stocks', maxStaleMin: 30 } as const;
 
 async function readMarketFreshness(): Promise<string> {
-  const meta = await readJsonFromUpstash(MARKET_FRESHNESS_CHECK.key).catch(() => null);
+  // Seeder-owned seed-meta (#7674): the seeder fleet stamps it bare, so the
+  // probe reads raw in every environment.
+  const meta = await readJsonFromUpstash(MARKET_FRESHNESS_CHECK.key, 3_000, true).catch(() => null);
   const { cached_at, stale } = evaluateFreshness([MARKET_FRESHNESS_CHECK], [meta]);
   return JSON.stringify({ cached_at, stale });
 }
@@ -184,7 +187,10 @@ export async function buildAccountAllowanceResourceResponse(
 
   let result: Array<{ result?: unknown; error?: unknown }> | null;
   try {
-    result = await deps.redisPipeline(commands);
+    // The allowance/quota counter keys are already deployment-prefixed by
+    // free-account-allowance.ts / quota.ts — send the commands verbatim
+    // (#7674).
+    result = await deps.redisPipeline(commands, 5_000, true);
   } catch {
     result = null;
   }
@@ -309,7 +315,7 @@ export const TEMPLATE_RESOURCE_REGISTRY: TemplateResourceDef[] = [
   {
     uriTemplate: 'worldmonitor://chokepoints/{slug}/status',
     name: 'Chokepoint Status',
-    description: 'Maritime chokepoint transit summary: today total / tanker / cargo counts, week-over-week change, risk level, incident count, disruption percentage, and risk narrative. URI param {slug} is one of the hand-curated kebab-case identifiers (suez, strait-of-malacca, strait-of-hormuz, bab-el-mandeb, panama-canal, taiwan-strait, cape-of-good-hope, strait-of-gibraltar, bosphorus, korea-strait, dover-strait, kerch-strait, lombok-strait).',
+    description: 'Maritime chokepoint transit summary: today total / tanker / cargo counts, week-over-week change, risk level, incident count, and disruption percentage. Generated riskSummary and riskReportAction prose is withheld as empty strings; this does not indicate low risk. URI param {slug} is one of the hand-curated kebab-case identifiers (suez, strait-of-malacca, strait-of-hormuz, bab-el-mandeb, panama-canal, taiwan-strait, cape-of-good-hope, strait-of-gibraltar, bosphorus, korea-strait, dover-strait, kerch-strait, lombok-strait).',
     mimeType: 'application/json',
     tool: 'get_chokepoint_status',
     paramExtractor: (uri: string) => {
@@ -615,7 +621,11 @@ export async function buildResourceResponse(
       wrappedText = innerText;
     } else {
       const { seedMetaKey, maxStaleMin } = matched.def.freshnessWrap;
-      const meta = await readJsonFromUpstash(seedMetaKey).catch(() => null);
+      const meta = await readJsonFromUpstash(
+        seedMetaKey,
+        3_000,
+        !isAppOwnedRedisKey(seedMetaKey),
+      ).catch(() => null);
       const { cached_at, stale } = evaluateFreshness(
         [{ key: seedMetaKey, maxStaleMin }],
         [meta],

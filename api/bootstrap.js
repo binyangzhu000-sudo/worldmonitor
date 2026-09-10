@@ -153,7 +153,7 @@ const ON_DEMAND_CACHE_PROFILES = {
     browser: 'max-age=60, stale-while-revalidate=120, stale-if-error=900',
     cdn: 'public, s-maxage=900, stale-while-revalidate=120, stale-if-error=900',
   },
-  // Planned IMD cyclone/port/coastal/marine seeder on a 15min interval against
+  // IMD cyclone/port/coastal/marine seeder on a 15min interval against
   // a 45min health budget (#7005). The public on-demand URL would otherwise
   // inherit the 2h slow shield and outlive health's stale declaration.
   imdCycloneMarine: {
@@ -293,7 +293,9 @@ async function getCachedJsonBatch(keys, shadowMarkerTier = null) {
 
   // Always read unprefixed keys — bootstrap is a read-only consumer of
   // production cache data. Preview/branch deploys don't run handlers that
-  // populate prefixed keys, so prefixing would always miss.
+  // populate prefixed keys, so prefixing would always miss. Declared
+  // explicitly since #7674 made the shared pipeline helpers prefix
+  // app-owned keys by default.
   const pipeline = keys.map((k) => ['GET', k]);
   if (shadowMarkerTier) {
     // This intentionally-missing marker makes shadow origin requests uniquely
@@ -301,7 +303,7 @@ async function getCachedJsonBatch(keys, shadowMarkerTier = null) {
     // so canonical GET counts alone no longer distinguish it from serving.
     pipeline.push(['GET', `bootstrap:r2-shadow-origin-marker:${shadowMarkerTier}`]);
   }
-  const data = await redisPipeline(pipeline, 3000);
+  const data = await redisPipeline(pipeline, 3000, true);
   if (!Array.isArray(data) || data.length !== pipeline.length) {
     throw new Error('Bootstrap Redis pipeline unavailable');
   }
@@ -595,6 +597,12 @@ export default async function handler(req, ctx) {
       }
       if (names[i] === 'wildfires') responseValue = compactWildfireBootstrapPayload(responseValue);
       if (names[i] === 'naturalEvents') responseValue = compactNaturalEventsDashboardPayload(responseValue);
+      if (names[i] === 'chokepoints' && Array.isArray(val?.chokepoints)) {
+        responseValue = { ...val, chokepoints: val.chokepoints.map(cp => cp?.transitSummary ? {
+          ...cp,
+          transitSummary: { ...cp.transitSummary, riskSummary: '', riskReportAction: '' },
+        } : cp) };
+      }
       data[names[i]] = responseValue;
     } else {
       missing.push(names[i]);

@@ -8,8 +8,11 @@ const zlib = require('node:zlib');
 const DECODO_GATE_HOST = 'gate.decodo.com';
 // Decodo's curl endpoint differs from its CONNECT endpoint.
 const DECODO_CURL_HOST = 'us.decodo.com';
-const DECODO_STICKY_PORT_MIN = 10_001;
-const DECODO_STICKY_PORT_MAX = 49_999;
+// Country endpoints have their own sticky ranges; never wrap into another pool.
+const DECODO_STICKY_PORT_RANGES = new Map([
+  [DECODO_GATE_HOST, [10_001, 49_999]],
+  ['cn.decodo.com', [30_001, 39_999]],
+]);
 
 function parseProxyConfig(raw) {
   if (!raw) return null;
@@ -55,32 +58,44 @@ function parseProxyConfig(raw) {
 }
 
 /**
- * Parse a proxy configuration and, for Decodo sticky gateway ports, advance
+ * Parse a proxy configuration and, for supported Decodo sticky ports, advance
  * each retry to a distinct sticky session. Other providers and Decodo rotating
  * ports retain their configured route exactly.
+ *
+ * `attempt` is sanitized HERE rather than at each entry point. It used to be
+ * clamped only inside resolveProxyStringForAttempt, which was fine while that
+ * was the only caller passing a live retry index — but #7963 exposed this
+ * function through httpsProxyFetchRaw's `proxyAttempt` option, and that helper
+ * is injected as the fetcher into seeders that run their own 1-based retry
+ * loops. An unsanitized index does not fail loudly: `+` concatenates before
+ * `%` coerces, so attempt '2' on port 10005 computes `4 + '2'` === `'42'` and
+ * silently exits on 10043, while a negative index resolves to 10000 — below
+ * the sticky floor and not a sticky exit at all.
  */
 function parseProxyConfigForAttempt(raw, attempt = 0) {
   const config = parseProxyConfig(raw);
   if (!config) return null;
+  const index = Number.isFinite(Number(attempt)) ? Math.max(0, Math.trunc(Number(attempt))) : 0;
   const port = Number(config.port);
   // Normalize for provider detection only: the host:port:user:pass form keeps
   // whatever casing the operator typed, while the URL form is lowercased by the
   // URL parser. config.host stays verbatim so the connection is unchanged.
   const host = String(config.host || '').toLowerCase().replace(/\.$/u, '');
+  const range = DECODO_STICKY_PORT_RANGES.get(host);
   if (
-    host !== DECODO_GATE_HOST
+    !range
     || !Number.isInteger(port)
-    || port < DECODO_STICKY_PORT_MIN
-    || port > DECODO_STICKY_PORT_MAX
+    || port < range[0]
+    || port > range[1]
   ) {
     return config;
   }
 
-  const stickyPortCount = DECODO_STICKY_PORT_MAX - DECODO_STICKY_PORT_MIN + 1;
+  const [minPort, maxPort] = range;
+  const stickyPortCount = maxPort - minPort + 1;
   return {
     ...config,
-    port: DECODO_STICKY_PORT_MIN
-      + ((port - DECODO_STICKY_PORT_MIN + attempt) % stickyPortCount),
+    port: minPort + ((port - minPort + index) % stickyPortCount),
   };
 }
 
@@ -146,8 +161,10 @@ function curlProxyString(cfg) {
  * advancing their port would point at a closed door.
  */
 function resolveProxyStringForAttempt(attempt = 0, raw = process.env.PROXY_URL || '') {
-  const index = Number.isFinite(Number(attempt)) ? Math.max(0, Math.trunc(Number(attempt))) : 0;
-  const cfg = parseProxyConfigForAttempt(raw, index);
+  // No local clamp: parseProxyConfigForAttempt sanitizes `attempt` itself now,
+  // with the identical expression. A second copy bought nothing and left two
+  // places to drift apart.
+  const cfg = parseProxyConfigForAttempt(raw, attempt);
   if (!cfg) return '';
   return curlProxyString(cfg);
 }

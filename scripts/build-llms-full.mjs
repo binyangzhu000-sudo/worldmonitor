@@ -6,9 +6,9 @@
  *     ahead of `## Live Instances` on every run.
  *   - public/llms-full.txt keeps its hand-authored brief above `## Generated
  *     corpus`; the comparisons index, glossary bodies, chokepoint
- *     methodology, published chokepoint explainers, CRI methodology, the
- *     corrections log, and the current ranking snapshot are inlined below
- *     that heading.
+ *     methodology, published chokepoint explainers, the forecast accuracy
+ *     record, CRI methodology, the corrections log, and the current ranking
+ *     snapshot are inlined below that heading.
  *
  * Usage:
  *   npm run build:llms-full          # rewrite whichever file is stale
@@ -20,8 +20,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { GLOSSARY_TERMS } from '../blog-site/src/data/glossary.ts';
+import { getRootlessDocsDestination } from '../src/config/docs-root-redirects.ts';
 import { COMPARISON_MATRIX_COLUMNS, comparisonDiscoveryEntries } from './build-comparison-pages.mjs';
-import { resolveLatestResilienceSnapshotPath, slugify } from './build-crawlable-corpus.mjs';
+import { renderAccuracyLlmsSection } from './build-accuracy-page.mjs';
+import { resolveLatestLivePulseSnapshotPath, resolveLatestResilienceSnapshotPath, slugify } from './build-crawlable-corpus.mjs';
 import { CHOKEPOINT_CONTENT } from './chokepoint-page-content.mjs';
 import { SITE_ORIGIN } from './discover-content-corpus-pages.mjs';
 import { buildSourceCatalog, buildSourcePages } from './crawlable-sources-page.mjs';
@@ -76,10 +78,47 @@ export function redactInternalApiOrigins(text) {
   }).join('\n');
 }
 
+/**
+ * Mintlify resolves a root-relative href against /docs. llms-full.txt is
+ * served from the site root, so the same href 308s (middleware rootless docs
+ * map, or vercel /api-reference/:match*). Rewrite only those paths. A site
+ * route such as /countries/ stays put.
+ */
+function rebaseInlinedDocsHref(href) {
+  const splitAt = [href.indexOf('#'), href.indexOf('?')].filter((index) => index >= 0);
+  const cut = splitAt.length > 0 ? Math.min(...splitAt) : href.length;
+  const path = href.slice(0, cut);
+  const suffix = href.slice(cut);
+  const normalized = path.length > 1 ? path.replace(/\/+$/, '') : path;
+  const destination = getRootlessDocsDestination(normalized);
+  if (destination) return `${new URL(destination).pathname}${suffix}`;
+  if (normalized === '/api-reference' || normalized.startsWith('/api-reference/')) {
+    return `/docs${normalized}${suffix}`;
+  }
+  return null;
+}
+
+function rebaseInlinedDocsLinks(text) {
+  return mapProseLines(text, (line) => line.replace(
+    /\]\((\/[^)\s]+)(\s+"[^"]*")?\)/g,
+    (full, href, title = '') => {
+      const next = rebaseInlinedDocsHref(href);
+      return next ? `](${next}${title})` : full;
+    },
+  ).replace(
+    /(<a\b[^>]*\bhref=")(\/[^"]+)(")/g,
+    (full, open, href, close) => {
+      const next = rebaseInlinedDocsHref(href);
+      return next ? `${open}${next}${close}` : full;
+    },
+  ));
+}
+
 function stripMdx(source) {
   let text = stripFrontmatter(source);
   text = text.replace(/<[A-Z][A-Za-z0-9]*[^>]*\/>/g, '');
   text = text.replace(/<\/?[A-Z][A-Za-z0-9]*[^>]*>/g, '');
+  text = rebaseInlinedDocsLinks(text);
   return redactInternalApiOrigins(text.replace(/\n{3,}/g, '\n\n').trim());
 }
 
@@ -193,6 +232,12 @@ function renderChokepointBlurbs() {
   return lines.join('\n');
 }
 
+function renderAccuracyFromSnapshot(rootDir) {
+  const snapshotPath = resolveLatestLivePulseSnapshotPath(rootDir);
+  const snapshot = JSON.parse(read(rootDir, snapshotPath));
+  return renderAccuracyLlmsSection(snapshot.forecastScorecard ?? null).trim();
+}
+
 function renderSnapshotTable(rootDir) {
   const snapshotPath = resolveLatestResilienceSnapshotPath(rootDir);
   const snapshot = JSON.parse(read(rootDir, snapshotPath));
@@ -289,7 +334,7 @@ export function buildLlmsFullText({ rootDir = ROOT } = {}) {
   const introduction = [
     LLMS_FULL_GENERATED_HEADING,
     '',
-    'The sections below are produced by `npm run build:llms-full` from the source catalog, comparison-page registry, glossary terms, chokepoint methodology, published chokepoint explainers, the Country Resilience Index methodology, the corrections log, and the current published ranking snapshot.',
+    'The sections below are produced by `npm run build:llms-full` from the source catalog, comparison-page registry, glossary terms, chokepoint methodology, published chokepoint explainers, the forecast accuracy snapshot, the Country Resilience Index methodology, the corrections log, and the current published ranking snapshot.',
     '',
     renderSourceDirectory(rootDir),
     '',
@@ -302,6 +347,7 @@ export function buildLlmsFullText({ rootDir = ROOT } = {}) {
   return withCorpusNavigation([
     { title: 'World Monitor', text: prefix },
     { title: 'Generated corpus', text: introduction },
+    { title: 'Forecast accuracy', text: renderAccuracyFromSnapshot(rootDir) },
     { title: 'Chokepoint methodology', text: `## Chokepoint methodology\n\n${stripMdx(read(rootDir, 'docs/methodology/chokepoints.mdx'))}` },
     { title: 'Chokepoint explainers', text: '## Chokepoint explainers' },
     ...CHOKEPOINT_BLOGS.map((relativePath) => {

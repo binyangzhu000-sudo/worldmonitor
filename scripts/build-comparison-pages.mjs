@@ -20,9 +20,59 @@ import {
   COMPARISON_NARRATIVES,
 } from './comparison-page-narratives.mjs';
 import { computeStats } from './docs-stats.mjs';
+import { renderRelatedReading } from './related-reading.mjs';
 
 /** Bump when hub or child copy changes so lastmod advances without touching every sibling. */
-export const COMPARISONS_CONTENT_VERSION = '2026-09-08';
+export const COMPARISONS_CONTENT_VERSION = '2026-09-10';
+
+// Editorial route choices: compare event datasets on conflict-country pages,
+// mapping tools on crisis pages, and delivery options on operational workflows.
+const CONTEXTUAL_COMPARISONS = {
+  '/countries/ukraine/': ['worldmonitor-vs-liveuamap', 'worldmonitor-vs-deepstatemap'],
+  ...Object.fromEntries(['sudan', 'syria', 'myanmar'].map((slug) => [
+    `/countries/${slug}/`, ['worldmonitor-vs-acled', 'worldmonitor-vs-gdelt'],
+  ])),
+  ...Object.fromEntries(['iran', 'israel', 'lebanon'].map((slug) => [
+    `/countries/${slug}/`, ['liveuamap-alternatives', 'worldmonitor-vs-liveuamap'],
+  ])),
+  '/tools/': ['mcp-servers-for-geopolitical-data', 'worldmonitor-vs-dataminr'],
+  '/tools/signal-convergence/': ['worldmonitor-vs-dataminr', 'worldmonitor-vs-recorded-future'],
+  '/tools/natural-hazard-pulse/': ['travel-risk-intelligence-vs-assistance', 'mcp-servers-for-geopolitical-data'],
+  '/tools/airspace-disruption-checker/': ['travel-risk-intelligence-vs-assistance', 'mcp-servers-for-geopolitical-data'],
+  '/use-cases/monitor-country-risk/': ['travel-risk-intelligence-vs-assistance', 'best-geopolitical-risk-dashboards'],
+  '/use-cases/verify-breaking-news/': ['worldmonitor-vs-dataminr', 'worldmonitor-vs-recorded-future'],
+  '/use-cases/monitor-supply-chain-disruptions/': ['chokepoint-monitoring-tools', 'worldmonitor-vs-recorded-future'],
+};
+
+const COMPARISON_GROUPS = [
+  ['liveuamap-alternatives', 'worldmonitor-vs-liveuamap', 'worldmonitor-vs-deepstatemap', 'worldmonitor-vs-acled', 'worldmonitor-vs-gdelt'],
+  ['best-geopolitical-risk-dashboards', 'free-geopolitical-risk-dashboards', 'worldmonitor-vs-dataminr', 'worldmonitor-vs-recorded-future'],
+  ['mcp-servers-for-geopolitical-data', 'worldmonitor-vs-gdelt', 'worldmonitor-vs-acled', 'free-geopolitical-risk-dashboards'],
+  ['chokepoint-monitoring-tools', 'travel-risk-intelligence-vs-assistance', 'best-geopolitical-risk-dashboards', 'worldmonitor-vs-dataminr'],
+];
+
+function comparisonAnchor(slug, escapeHtml) {
+  const page = COMPARISON_PAGES.find((entry) => entry.slug === slug);
+  if (!page) throw new Error(`Unknown comparison link: ${slug}`);
+  let label = page.h1;
+  if (slug === 'best-geopolitical-risk-dashboards') label = 'Geopolitical risk dashboard comparison';
+  else if (slug.startsWith('worldmonitor-vs-')) label = `World Monitor vs ${page.competitors[0]}`;
+  return `<a href="${page.path}">${escapeHtml(label)}</a>`;
+}
+
+export function renderContextualComparisons(path, escapeHtml) {
+  let slugs = CONTEXTUAL_COMPARISONS[path];
+  if (!slugs && /^\/countries\/[^/]+\/$/.test(path)) slugs = ['best-geopolitical-risk-dashboards', 'free-geopolitical-risk-dashboards'];
+  if (!slugs && /^\/chokepoints\/[^/]+\/$/.test(path)) slugs = ['chokepoint-monitoring-tools'];
+  if (!slugs && /^\/crises\/[^/]+\/$/.test(path)) slugs = ['worldmonitor-vs-liveuamap', 'worldmonitor-vs-deepstatemap'];
+  if (!slugs?.length) return '';
+  return `<p data-contextual-comparisons>How World Monitor compares: ${slugs.map((slug) => comparisonAnchor(slug, escapeHtml)).join(' · ')}.</p>`;
+}
+
+function renderSiblingComparisons(slug, escapeHtml) {
+  const siblings = COMPARISON_GROUPS.find((group) => group.includes(slug)).filter((item) => item !== slug).slice(0, 4);
+  return `<h2>Related comparisons</h2>\n<p>Compare related tools by coverage, access requirements and workflow before choosing a monitoring setup.</p>\n<ul class="related">\n${siblings.map((item) => `<li>${comparisonAnchor(item, escapeHtml)}</li>`).join('\n')}\n</ul>`;
+}
 
 /**
  * Universal comparison-matrix columns. Engines lift these cells verbatim, so
@@ -78,6 +128,7 @@ export const COMPARISON_HUB_MATRIX_ROWS = [
 const COMPARISON_PAGE_SEEDS = [
   {
     slug: 'liveuamap-alternatives',
+    metaDescription: 'Compare Liveuamap alternatives for conflict mapping and global intelligence, with a feature matrix covering pricing, data coverage, API access and licensing.',
     path: '/compare/liveuamap-alternatives/',
     title: 'Liveuamap Alternatives | World Monitor',
     h1: 'Liveuamap Alternatives',
@@ -312,10 +363,11 @@ const COMPARISON_PAGE_SEEDS = [
     h1: 'MCP Servers for Geopolitical Data',
     competitors: ['world-intel-mcp', 'Satellite MCP', 'OSINT MCP', 'war-dashboard-data', 'GDELT Cloud MCP', 'Off-Nadir Delta', 'IMF PortWatch MCP'],
     claim: 'Hosted agent-native access',
+    metaDescription: 'Compare hosted World Monitor MCP with self-hosted geopolitical MCP servers on OAuth, quotas, country risk, tariffs, and multi-domain coverage.',
     summary: 'Hosted versus self-hosted MCP access to geopolitical data: World Monitor against world-intel-mcp, Satellite MCP, OSINT MCP, GDELT Cloud MCP and IMF PortWatch MCP on entitlements, quotas, OAuth and hosting burden.',
     heading: 'MCP servers for geopolitical data',
     matrixRows: [
-      ['World Monitor (hosted)', 'Free dashboard; MCP from $39.99/mo (Pro)', WORLD_MONITOR_UPDATE_CADENCE, 'Conflict, maritime AIS, aviation, markets, cyber, climate', 'No', 'From $99.99/mo (API Starter)', 'Yes (hosted, entitlements + quotas + OAuth)', 'AGPL-3.0', WORLD_MONITOR_SOURCE_COUNT_CELL, 'Live + rolling published snapshots', 'Hosted, governed multi-domain access for agents'],
+      ['World Monitor (hosted)', 'Free dashboard; MCP from $39.99/mo (Pro)', WORLD_MONITOR_UPDATE_CADENCE, 'Conflict, maritime AIS, aviation, markets, tariffs, cyber, climate', 'No', 'From $99.99/mo (API Starter)', 'Yes (hosted, entitlements + quotas + OAuth)', 'AGPL-3.0', WORLD_MONITOR_SOURCE_COUNT_CELL, 'Live + rolling published snapshots', 'Hosted, governed multi-domain access for agents'],
       ['world-intel-mcp', 'Free (MIT, self-hosted)', 'Upstream dependent', 'GDELT-derived event data', 'Self-host', 'GDELT-based', MCP_VERIFIED_SELF_HOSTED, 'MIT', 'Upstream public feeds', 'As retained', 'Self-hosted GDELT event surface'],
       ['Satellite MCP', 'Free (open source, self-hosted)', 'Pass-schedule dependent', 'Satellite imagery and passes', 'Self-host', 'Upstream dependent', MCP_VERIFIED_SELF_HOSTED, 'Open source', 'Public satellite catalogs', 'As retained', 'Satellite pass scheduling for self-hosters'],
       ['OSINT MCP', 'Free (open source, self-hosted)', 'Upstream dependent', 'OSINT tooling surface', 'Self-host', 'Upstream dependent', MCP_VERIFIED_SELF_HOSTED, 'Open source', 'Public OSINT sources', 'As retained', 'Broad OSINT tool surface for self-hosters'],
@@ -590,12 +642,12 @@ function renderMeasurement(slug, snapshotDate, escapeHtml) {
   ];
 }
 
-function renderComparePage(page, { tpl, baseUrl, lastmod, snapshotDate }) {
+function renderComparePage(page, { tpl, baseUrl, lastmod, snapshotDate, relatedReading = [] }) {
   const { escapeHtml, breadcrumbLd, pageDocument } = tpl;
   const pageUrl = new URL(page.path, baseUrl).href;
-  const description = page.h1
+  const description = page.metaDescription ?? (page.h1
     + ' - ' + page.claim
-    + '. Full comparison matrix, honest concessions, and FAQs.';
+    + '. Full comparison matrix, honest concessions, and FAQs.');
   assertMetaDescription(description, page.slug);
 
   const jsonLd = [];
@@ -680,6 +732,8 @@ function renderComparePage(page, { tpl, baseUrl, lastmod, snapshotDate }) {
       page.slug + ' methodology',
     ),
     '',
+    renderRelatedReading(relatedReading, escapeHtml),
+    renderSiblingComparisons(page.slug, escapeHtml),
     '      <h2>Frequently asked questions</h2>',
     ...page.faqs.flatMap(([question, answer]) => [
       '      <h3>' + escapeHtml(question) + '</h3>',
@@ -805,7 +859,7 @@ function renderCompareHub({ tpl, baseUrl, lastmod, snapshotDate }) {
   });
 }
 
-export function writeComparisonPages({ outDir, baseUrl, tpl, snapshotDate, lastmod = COMPARISONS_CONTENT_VERSION }) {
+export function writeComparisonPages({ outDir, baseUrl, tpl, snapshotDate, lastmod = COMPARISONS_CONTENT_VERSION, relatedReading = new Map() }) {
   mkdirSync(join(outDir, 'compare'), { recursive: true });
   writeFileSync(
     join(outDir, 'compare', 'index.html'),
@@ -815,7 +869,7 @@ export function writeComparisonPages({ outDir, baseUrl, tpl, snapshotDate, lastm
     mkdirSync(join(outDir, 'compare', page.slug), { recursive: true });
     writeFileSync(
       join(outDir, 'compare', page.slug, 'index.html'),
-      renderComparePage(page, { tpl, baseUrl, lastmod, snapshotDate }),
+      renderComparePage(page, { tpl, baseUrl, lastmod, snapshotDate, relatedReading: relatedReading.get(page.path) }),
     );
   }
 }

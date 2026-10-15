@@ -37,7 +37,7 @@ const SECRET_MANAGEMENT_WINDOWS: [&str; 2] = ["main", "settings"];
 const DESKTOP_SHARED_SECRET_KEY: &str = "WM_DESKTOP_SHARED_SECRET";
 const BUILD_TIME_SIDECAR_ENV_KEYS: [&str; 2] = ["CONVEX_URL", DESKTOP_SHARED_SECRET_KEY];
 const SUPPORTED_SECRET_KEYS: [&str; 30] = [
-    "GROQ_API_KEY",
+    "ATLASCLOUD_API_KEY",
     "OPENROUTER_API_KEY",
     "EXA_API_KEYS",
     "BRAVE_API_KEYS",
@@ -1209,10 +1209,11 @@ mod sanitize_path_tests {
     #[test]
     fn configured_secret_metadata_filters_internal_values_and_keys() {
         let secrets = HashMap::from([
-            ("GROQ_API_KEY".to_string(), "secret-value".to_string()),
+            ("OPENROUTER_API_KEY".to_string(), "secret-value".to_string()),
+            ("GROQ_API_KEY".to_string(), "retired-value".to_string()),
             (DESKTOP_SHARED_SECRET_KEY.to_string(), "internal-value".to_string()),
         ]);
-        assert_eq!(configured_renderer_secret_keys(&secrets), vec!["GROQ_API_KEY"]);
+        assert_eq!(configured_renderer_secret_keys(&secrets), vec!["OPENROUTER_API_KEY"]);
     }
 
     #[test]

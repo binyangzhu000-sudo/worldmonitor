@@ -76,6 +76,8 @@ export interface PizzintLocation {
   isClosedNow: boolean;
   lat: number;
   lng: number;
+  noLiveSignal: boolean;
+  hasBaseline: boolean;
 }
 
 export interface GdeltTensionPair {
@@ -135,6 +137,7 @@ export interface GetCountryIntelBriefResponse {
   model: string;
   generatedAt: number;
   sources: BriefSource[];
+  evidence: BriefEvidence[];
 }
 
 export interface BriefSource {
@@ -142,6 +145,16 @@ export interface BriefSource {
   source: string;
   url: string;
   publishedAt: string;
+}
+
+export interface BriefEvidence {
+  id: string;
+  kind: string;
+  label: string;
+  value: string;
+  factText: string;
+  asOf: string;
+  url: string;
 }
 
 export interface GetCountryCoverageRequest {
@@ -643,6 +656,21 @@ export interface TransmissionNode {
   node: string;
   impactType: string;
   logic: string;
+}
+
+export interface ListWsbTickersRequest {
+}
+
+export interface ListWsbTickersResponse {
+  tickers: WsbTicker[];
+}
+
+export interface WsbTicker {
+  symbol: string;
+  mentionCount: number;
+  totalScore: number;
+  subreddits: string[];
+  velocityScore: number;
 }
 
 export interface GetSocialVelocityRequest {
@@ -1763,6 +1791,29 @@ export class IntelligenceServiceClient {
     }
 
     return await resp.json() as ListMarketImplicationsResponse;
+  }
+
+  async listWsbTickers(_req: ListWsbTickersRequest, options?: IntelligenceServiceCallOptions): Promise<ListWsbTickersResponse> {
+    let path = "/api/intelligence/v1/list-wsb-tickers";
+    const url = this.baseURL + path;
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.defaultHeaders,
+      ...options?.headers,
+    };
+
+    const resp = await this.fetchFn(url, {
+      method: "GET",
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!resp.ok) {
+      return this.handleError(resp);
+    }
+
+    return await resp.json() as ListWsbTickersResponse;
   }
 
   async getSocialVelocity(_req: GetSocialVelocityRequest, options?: IntelligenceServiceCallOptions): Promise<GetSocialVelocityResponse> {

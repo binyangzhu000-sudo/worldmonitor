@@ -22,7 +22,6 @@ export interface DesktopReadinessCheck {
 const keyBackedFeatures: RuntimeFeatureId[] = [
   'aiOllama',
   'aiAtlasCloud',
-  'aiGroq',
   'aiOpenRouter',
   'economicFred',
   'internetOutages',
@@ -41,11 +40,12 @@ export const DESKTOP_PARITY_FEATURES: DesktopParityFeature[] = [
   {
     id: 'live-news',
     panel: 'LiveNewsPanel',
-    serviceFiles: ['src/services/live-news.ts'],
-    apiRoutes: ['/api/youtube/live'],
-    apiHandlers: ['api/youtube/live.js'],
+    serviceFiles: ['src/services/live-video/session.ts', 'src/live-channels-window.ts'],
+    // The session plays YouTube through the sidecar player; channel management names an added video through /api/youtube/live.
+    apiRoutes: ['/api/youtube-embed', '/api/youtube/live'],
+    apiHandlers: ['src-tauri/sidecar/local-api-server.mjs', 'api/youtube/live.js'],
     locality: 'fully-local',
-    fallback: 'Channel fallback video IDs are used when live detection fails.',
+    fallback: 'Each channel tries its broadcaster stream, then verified YouTube streams; a channel with nothing live says why.',
     priority: 1,
   },
   {
@@ -131,7 +131,7 @@ export function getDesktopReadinessChecks(localBackendEnabled: boolean): Desktop
     { id: 'startup', label: 'Desktop startup + sidecar API health', ready: localBackendEnabled },
     { id: 'map', label: 'Map rendering (local layers + static geo assets)', ready: true },
     { id: 'core-intel', label: 'Core intelligence panels (Live News, Monitor, Strategic Risk)', ready: true },
-    { id: 'summaries', label: 'Summaries (provider-backed or browser fallback)', ready: isFeatureAvailable('aiOllama') || isFeatureAvailable('aiAtlasCloud') || isFeatureAvailable('aiGroq') || isFeatureAvailable('aiOpenRouter') },
+    { id: 'summaries', label: 'Summaries (provider-backed or browser fallback)', ready: isFeatureAvailable('aiOllama') || isFeatureAvailable('aiAtlasCloud') || isFeatureAvailable('aiOpenRouter') },
     { id: 'market', label: 'Market panel live data paths', ready: true },
     { id: 'live-tracking', label: 'At least one live-tracking mode (AIS or OpenSky)', ready: liveTrackingReady },
   ];

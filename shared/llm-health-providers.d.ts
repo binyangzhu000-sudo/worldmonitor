@@ -1,5 +1,5 @@
 export interface LlmHealthProvider {
-  name: 'ollama' | 'groq' | 'openrouter' | 'atlascloud';
+  name: 'ollama' | 'openrouter' | 'atlascloud';
   url: string;
   allowPrivateNetwork: boolean;
 }

@@ -14,7 +14,7 @@ import {
 } from './mcp/bounded-body';
 import { MAX_JSON_RPC_BODY_BYTES, MAX_MCP_PROXY_RESPONSE_BYTES } from './mcp/body-limits';
 import { McpProxyJsonDepthError, parseMcpProxyJson } from './mcp/bounded-json';
-import { ENDPOINT_RATE_POLICIES, checkScopedRateLimit, getClientIp } from '../server/_shared/rate-limit';
+import { ENDPOINT_RATE_POLICIES, checkScopedRateLimit, checkIpScopedEdgeProof, getClientIp, rateLimitKeyForIp } from '../server/_shared/rate-limit';
 import { captureSilentError } from './_sentry-edge.js';
 import {
   buildRequestEvent,
@@ -69,6 +69,12 @@ function logProxyCall(entry: {
   header_names: string[];
   status: number;
   duration_ms: number;
+  upstream_status?: number | null;
+  // JSON-RPC error code the remote server answered with on HTTP 200, when
+  // it did. Those rejections no longer reach Sentry (WORLDMONITOR-172), so
+  // this row is where a proxy-wide regression (every server answering
+  // -32602 to our initialize) would show.
+  upstream_rpc_code?: number | null;
 }): void {
   // Structured audit log (#3805). Mirrors the `[name] { ...fields }` shape
   // used by api/cache-purge.js so the existing log-ingest tooling parses it
@@ -169,10 +175,11 @@ function emitProxyUsage(req, status: number, durationMs: number, ctx, callerIden
       durationMs,
       reqBytes: deriveReqBytes(req),
       // Not tracked: the proxy streams upstream bodies through bounded readers
-      // and jsonResponse sets no content-length, so there is no byte count to
-      // report without buffering a second time. Size questions belong to
-      // MAX_MCP_PROXY_RESPONSE_BYTES, not to this row.
-      resBytes: 0,
+      // and jsonResponse Content-Length reflects only the local denial/error
+      // envelopes — never the proxied upstream size. Size questions belong to
+      // MAX_MCP_PROXY_RESPONSE_BYTES, not to this row. null (not 0) so unknown
+      // is not confused with an empty body (#8403).
+      resBytes: null,
       customerId: usageIdentity.customer_id,
       principalId: usageIdentity.principal_id,
       authKind: usageIdentity.auth_kind,
@@ -245,8 +252,27 @@ export class McpProxyUpstreamError extends Error {
   constructor(message, options) {
     super(message, options);
     this.name = 'McpProxyUpstreamError';
+    // HTTP status the remote MCP server answered with, when it answered.
+    this.upstreamStatus = options?.upstreamStatus ?? null;
+    // The remote server answered the request with a JSON-RPC `error` object
+    // (HTTP 200). `upstreamRpcCode` carries its numeric code for the audit
+    // log; the message is caller-chosen server output and is not retained.
+    const rpcError = options?.upstreamRpcError;
+    this.upstreamRpcRejected = rpcError !== undefined && rpcError !== null;
+    this.upstreamRpcCode = Number.isInteger(rpcError?.code) ? rpcError.code : null;
   }
 }
+
+/** The remote server answered `{ error }` for `step` — its decision, carried whole. */
+function upstreamRpcRejection(step, rpcError) {
+  return new McpProxyUpstreamError(`${step} error: MCP server rejected request`, { upstreamRpcError: rpcError });
+}
+
+// The remote server refused the credentials the CALLER supplied (a panel saved
+// without its key, an expired token). That is the caller's configuration, not
+// a proxy defect, so it stays out of Sentry and lives in the audit log
+// (WORLDMONITOR-172).
+const UPSTREAM_CREDENTIAL_REJECTIONS = new Set([401, 403]);
 
 export function proxyFailureFor(error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -260,6 +286,16 @@ export function proxyFailureFor(error) {
   return {
     isTimeout,
     level: isTimeout || isExpectedExternal ? 'warning' : 'error',
+    // Sentry grouping key. Every proxy error class sets `this.name`, so this
+    // separates expected upstream failures from unknown proxy defects.
+    errorClass: isTimeout ? 'timeout' : (error instanceof Error ? error.name : 'Error'),
+    // A JSON-RPC `error` answered on HTTP 200 is the same class as a 401/403:
+    // the remote server's verdict on the caller's own request (a keyless panel
+    // past its free quota, an unknown tool). One search.parallel.ai panel
+    // produced 226 such events in two weeks (WORLDMONITOR-172 regrowth). The
+    // audit log keeps the JSON-RPC code instead.
+    report: !(error instanceof McpProxyUpstreamError
+      && (UPSTREAM_CREDENTIAL_REJECTIONS.has(error.upstreamStatus) || error.upstreamRpcRejected)),
   };
 }
 
@@ -291,16 +327,17 @@ function throwBlockedAddress(blockedAddress) {
   throw new McpProxySsrfError(SSRF_BLOCKED_PUBLIC_MESSAGE);
 }
 
-async function resolveDnsJson(hostname, recordType) {
+async function resolveDnsJson(hostname, recordType, signal) {
   const url = new URL(DNS_JSON_ENDPOINT);
   url.searchParams.set('name', hostname);
   url.searchParams.set('type', recordType);
+  const dnsTimeout = AbortSignal.timeout(DNS_RESOLUTION_TIMEOUT_MS);
   const response = await fetch(url.toString(), {
     headers: {
       Accept: 'application/dns-json',
       'User-Agent': 'WorldMonitor-MCP-Proxy/1.0',
     },
-    signal: AbortSignal.timeout(DNS_RESOLUTION_TIMEOUT_MS),
+    signal: signal ? AbortSignal.any([signal, dnsTimeout]) : dnsTimeout,
   });
   if (!response.ok) {
     throw new Error(`DNS ${recordType} lookup failed: HTTP ${response.status}`);
@@ -315,20 +352,21 @@ async function resolveDnsJson(hostname, recordType) {
     .map(answer => answer.data);
 }
 
-async function defaultResolveHostname(hostname) {
+async function defaultResolveHostname(hostname, signal) {
   const resolveHostnameForTest = getResolveHostnameForTest();
-  if (resolveHostnameForTest) return resolveHostnameForTest(hostname);
+  if (resolveHostnameForTest) return resolveHostnameForTest(hostname, signal);
   const records = await Promise.all([
-    resolveDnsJson(hostname, 'A'),
-    resolveDnsJson(hostname, 'AAAA'),
+    resolveDnsJson(hostname, 'A', signal),
+    resolveDnsJson(hostname, 'AAAA', signal),
   ]);
   return records.flat();
 }
 
-async function assertServerUrlSafe(url) {
+async function assertServerUrlSafe(url, signal) {
+  signal?.throwIfAborted();
   const hostname = url.hostname.toLowerCase();
   if (BLOCKED_HOSTNAMES.has(hostname)) {
-    throw new McpProxySsrfError(`serverUrl hostname is blocked: ${hostname}`);
+    throw new McpProxySsrfError('serverUrl hostname is blocked');
   }
   if (isBlockedResolvedAddress(hostname)) {
     throwBlockedAddress(hostname);
@@ -336,10 +374,12 @@ async function assertServerUrlSafe(url) {
 
   let resolvedAddresses;
   try {
-    resolvedAddresses = await defaultResolveHostname(hostname);
+    resolvedAddresses = await defaultResolveHostname(hostname, signal);
   } catch (error) {
+    signal?.throwIfAborted();
     throw new McpProxySsrfError('serverUrl DNS resolution failed', { cause: error });
   }
+  signal?.throwIfAborted();
 
   if (!resolvedAddresses.length) {
     throw new McpProxySsrfError('serverUrl DNS resolution returned no addresses');
@@ -361,8 +401,8 @@ async function assertServerUrlSafe(url) {
 // dispatch NARROWS that DNS-rebinding window but does not close it. The
 // residual rebind window is an ACCEPTED limitation of the Edge runtime (no
 // socket-level pin available) — documented, not fixed here (P2, issue #5061).
-async function revalidateBeforeFetch(url) {
-  await assertServerUrlSafe(url);
+async function revalidateBeforeFetch(url, signal) {
+  await assertServerUrlSafe(url, signal);
 }
 
 function buildInitPayload() {
@@ -434,18 +474,90 @@ function buildHeaders(customHeaders) {
 
 // --- Streamable HTTP transport (MCP 2025-03-26) ---
 
+// Bounded redirect follow. `redirect: 'manual'` below stays load-bearing: the
+// Edge runtime cannot pin a TLS connection to a vetted address, so every
+// dispatch re-resolves the host through assertServerUrlSafe. Letting `fetch()`
+// follow a redirect on its own would hand an upstream a way to bounce this
+// proxy onto an internal address without that re-check. So we follow at most
+// ONE hop by hand, and only after the Location clears the same guard the
+// original serverUrl did.
+//
+// Vendors do move a published MCP endpoint and leave a permanent redirect
+// behind (a shipped preset went dark this way — every call died on the 308
+// rather than the one-line move the vendor intended).
+const MAX_REDIRECT_HOPS = 1;
+
+// Only method-preserving redirects are followed. 301/302/303 permit a client to
+// rewrite the request to GET, which is meaningless for JSON-RPC and would
+// silently turn a tools/call into a bodyless GET.
+const METHOD_PRESERVING_REDIRECTS = new Set([307, 308]);
+
+// Headers that may cross an origin boundary. Everything else this proxy is
+// carrying is caller-supplied credential material (the Alpha Vantage, Datadog
+// and Slack presets all send a Bearer token; Mcp-Session-Id is a session
+// credential minted by the *previous* origin), and an upstream chooses the
+// redirect target — forwarding those to whatever host it names in a Location
+// header would hand the caller's key to a third party. This is an allowlist on
+// purpose: a denylist of known-sensitive header names is exactly the
+// name-shaped trampoline that cannot match the spelling it has not seen.
+const CROSS_ORIGIN_SAFE_HEADERS = new Set(['content-type', 'accept', 'user-agent']);
+
+function redirectTargetFor(response, fromUrl) {
+  const location = response.headers.get('location');
+  if (!location) return null;
+  let next;
+  try {
+    next = new URL(location, fromUrl);
+  } catch {
+    return null;
+  }
+  // assertServerUrlSafe vets the host but not the scheme, and the entry-point
+  // https check in validateServerUrl never sees a redirect target — so a
+  // downgrade to http:// has to be refused right here.
+  if (next.protocol !== 'https:') return null;
+  return next;
+}
+
+function stripToCrossOriginSafeHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (CROSS_ORIGIN_SAFE_HEADERS.has(key.toLowerCase())) out[key] = value;
+  }
+  return out;
+}
+
 async function postJson(url, body, headers, sessionId) {
   const h = { ...headers };
   if (sessionId) h['Mcp-Session-Id'] = sessionId;
-  await revalidateBeforeFetch(url);
-  const resp = await fetchMcpUpstream(url.toString(), {
-    method: 'POST',
-    headers: h,
-    body: JSON.stringify(body),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  return resp;
+  const payload = JSON.stringify(body);
+  let target = url;
+  let outboundHeaders = h;
+  // ONE deadline for the whole exchange, not one per hop — a per-hop signal
+  // would quietly hand a redirecting upstream twice the budget every other
+  // dispatch gets.
+  const signal = AbortSignal.timeout(TIMEOUT_MS);
+  for (let hop = 0; ; hop++) {
+    await revalidateBeforeFetch(target, signal);
+    signal.throwIfAborted();
+    const resp = await fetchMcpUpstream(target.toString(), {
+      method: 'POST',
+      headers: outboundHeaders,
+      body: payload,
+      redirect: 'manual',
+      signal,
+    });
+    if (hop >= MAX_REDIRECT_HOPS || !METHOD_PRESERVING_REDIRECTS.has(resp.status)) {
+      return { response: resp, url: target, headers: outboundHeaders };
+    }
+    const next = redirectTargetFor(resp, target);
+    // An unfollowable redirect (no Location, unparseable, or an http://
+    // downgrade) is returned as-is so the caller still reports the upstream
+    // status it actually got, exactly as before this hop existed.
+    if (!next) return { response: resp, url: target, headers: outboundHeaders };
+    await cancelResponseBody(resp);
+    if (next.origin !== target.origin) outboundHeaders = stripToCrossOriginSafeHeaders(outboundHeaders);
+    target = next;
+  }
 }
 
 async function cancelResponseBody(response) {
@@ -483,7 +595,7 @@ async function parseJsonRpcResponse(resp) {
 
 async function sendInitialized(serverUrl, headers, sessionId) {
   try {
-    const response = await postJson(serverUrl, {
+    const { response } = await postJson(serverUrl, {
       jsonrpc: '2.0',
       method: 'notifications/initialized',
       params: {},
@@ -496,37 +608,39 @@ async function sendInitialized(serverUrl, headers, sessionId) {
 }
 
 async function mcpListTools(serverUrl, customHeaders) {
-  const headers = buildHeaders(customHeaders);
-  const initResp = await postJson(serverUrl, buildInitPayload(), headers, null);
-  if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`);
+  const { response: initResp, url: sessionUrl, headers } = await postJson(
+    serverUrl, buildInitPayload(), buildHeaders(customHeaders), null,
+  );
+  if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`, { upstreamStatus: initResp.status });
   const sessionId = initResp.headers.get('Mcp-Session-Id') || initResp.headers.get('mcp-session-id');
   const initData = await parseJsonRpcResponse(initResp);
-  if (initData.error) throw new McpProxyUpstreamError(`Initialize error: ${initData.error.message}`);
-  await sendInitialized(serverUrl, headers, sessionId);
-  const listResp = await postJson(serverUrl, {
+  if (initData.error) throw upstreamRpcRejection('Initialize', initData.error);
+  await sendInitialized(sessionUrl, headers, sessionId);
+  const { response: listResp } = await postJson(sessionUrl, {
     jsonrpc: '2.0', id: 2, method: 'tools/list', params: {},
   }, headers, sessionId);
-  if (!listResp.ok) throw new McpProxyUpstreamError(`tools/list failed: HTTP ${listResp.status}`);
+  if (!listResp.ok) throw new McpProxyUpstreamError(`tools/list failed: HTTP ${listResp.status}`, { upstreamStatus: listResp.status });
   const listData = await parseJsonRpcResponse(listResp);
-  if (listData.error) throw new McpProxyUpstreamError(`tools/list error: ${listData.error.message}`);
+  if (listData.error) throw upstreamRpcRejection('tools/list', listData.error);
   return listData.result?.tools || [];
 }
 
 async function mcpCallTool(serverUrl, toolName, toolArgs, customHeaders) {
-  const headers = buildHeaders(customHeaders);
-  const initResp = await postJson(serverUrl, buildInitPayload(), headers, null);
-  if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`);
+  const { response: initResp, url: sessionUrl, headers } = await postJson(
+    serverUrl, buildInitPayload(), buildHeaders(customHeaders), null,
+  );
+  if (!initResp.ok) throw new McpProxyUpstreamError(`Initialize failed: HTTP ${initResp.status}`, { upstreamStatus: initResp.status });
   const sessionId = initResp.headers.get('Mcp-Session-Id') || initResp.headers.get('mcp-session-id');
   const initData = await parseJsonRpcResponse(initResp);
-  if (initData.error) throw new McpProxyUpstreamError(`Initialize error: ${initData.error.message}`);
-  await sendInitialized(serverUrl, headers, sessionId);
-  const callResp = await postJson(serverUrl, {
+  if (initData.error) throw upstreamRpcRejection('Initialize', initData.error);
+  await sendInitialized(sessionUrl, headers, sessionId);
+  const { response: callResp } = await postJson(sessionUrl, {
     jsonrpc: '2.0', id: 3, method: 'tools/call',
     params: { name: toolName, arguments: toolArgs || {} },
   }, headers, sessionId);
-  if (!callResp.ok) throw new McpProxyUpstreamError(`tools/call failed: HTTP ${callResp.status}`);
+  if (!callResp.ok) throw new McpProxyUpstreamError(`tools/call failed: HTTP ${callResp.status}`, { upstreamStatus: callResp.status });
   const callData = await parseJsonRpcResponse(callResp);
-  if (callData.error) throw new McpProxyUpstreamError(`tools/call error: ${callData.error.message}`);
+  if (callData.error) throw upstreamRpcRejection('tools/call', callData.error);
   return callData.result;
 }
 
@@ -568,7 +682,7 @@ class SseSession {
       redirect: 'manual',
       signal: AbortSignal.timeout(SSE_CONNECT_TIMEOUT_MS),
     });
-    if (!resp.ok) throw new McpProxyUpstreamError(`SSE connect HTTP ${resp.status}`);
+    if (!resp.ok) throw new McpProxyUpstreamError(`SSE connect HTTP ${resp.status}`, { upstreamStatus: resp.status });
     this._reader = resp.body.getReader();
     this._startReadLoop();
     await this._endpointDeferred.promise;
@@ -687,7 +801,7 @@ class SseSession {
       await cancelResponseBody(postResp);
       if (!postResp.ok) {
         this._pending.delete(id);
-        throw new McpProxyUpstreamError(`${method} POST HTTP ${postResp.status}`);
+        throw new McpProxyUpstreamError(`${method} POST HTTP ${postResp.status}`, { upstreamStatus: postResp.status });
       }
       return await deferred.promise;
     } finally {
@@ -722,10 +836,10 @@ async function mcpListToolsSse(serverUrl, customHeaders) {
       capabilities: {},
       clientInfo: { name: 'worldmonitor', version: '1.0' },
     });
-    if (initResp.error) throw new McpProxyUpstreamError(`Initialize error: ${initResp.error.message}`);
+    if (initResp.error) throw upstreamRpcRejection('Initialize', initResp.error);
     await session.notify('notifications/initialized', {});
     const listResp = await session.send(2, 'tools/list', {});
-    if (listResp.error) throw new McpProxyUpstreamError(`tools/list error: ${listResp.error.message}`);
+    if (listResp.error) throw upstreamRpcRejection('tools/list', listResp.error);
     return listResp.result?.tools || [];
   } finally {
     session.close();
@@ -742,10 +856,10 @@ async function mcpCallToolSse(serverUrl, toolName, toolArgs, customHeaders) {
       capabilities: {},
       clientInfo: { name: 'worldmonitor', version: '1.0' },
     });
-    if (initResp.error) throw new McpProxyUpstreamError(`Initialize error: ${initResp.error.message}`);
+    if (initResp.error) throw upstreamRpcRejection('Initialize', initResp.error);
     await session.notify('notifications/initialized', {});
     const callResp = await session.send(2, 'tools/call', { name: toolName, arguments: toolArgs || {} });
-    if (callResp.error) throw new McpProxyUpstreamError(`tools/call error: ${callResp.error.message}`);
+    if (callResp.error) throw upstreamRpcRejection('tools/call', callResp.error);
     return callResp.result;
   } finally {
     session.close();
@@ -771,14 +885,13 @@ function captureMeta(serverUrl: URL, customHeaders: unknown, meta: ProxyMeta): v
 async function handleListTools(req: Request, cors: Record<string, string>, meta: ProxyMeta): Promise<Response> {
   const url = new URL(req.url);
   const rawServer = url.searchParams.get('serverUrl');
-  const rawHeaders = url.searchParams.get('headers');
+  if (url.searchParams.has('headers')) {
+    return jsonResponse({ error: 'Use POST tools/list with customHeaders in the JSON body' }, 400, cors);
+  }
   if (!rawServer) return jsonResponse({ error: 'Missing serverUrl' }, 400, cors);
   const serverUrl = await validateServerUrl(rawServer);
   if (!serverUrl) return jsonResponse({ error: 'Invalid serverUrl' }, 400, cors);
-  let customHeaders = {};
-  if (rawHeaders) {
-    try { customHeaders = JSON.parse(rawHeaders); } catch { /* ignore */ }
-  }
+  const customHeaders = {};
   captureMeta(serverUrl, customHeaders, meta);
   const tools = isSseTransport(serverUrl)
     ? await mcpListToolsSse(serverUrl, customHeaders)
@@ -800,12 +913,19 @@ async function handleCallTool(req: Request, cors: Record<string, string>, meta: 
     }
     return jsonResponse({ error: 'Invalid JSON' }, 400, cors);
   }
-  const { serverUrl: rawServer, toolName, toolArgs, customHeaders } = body;
+  const { serverUrl: rawServer, toolName, toolArgs, customHeaders, action } = body;
   if (!rawServer) return jsonResponse({ error: 'Missing serverUrl' }, 400, cors);
-  if (!toolName) return jsonResponse({ error: 'Missing toolName' }, 400, cors);
+  if (action !== undefined && action !== 'tools/list') return jsonResponse({ error: 'Invalid action' }, 400, cors);
+  if (action !== 'tools/list' && !toolName) return jsonResponse({ error: 'Missing toolName' }, 400, cors);
   const serverUrl = await validateServerUrl(rawServer);
   if (!serverUrl) return jsonResponse({ error: 'Invalid serverUrl' }, 400, cors);
   captureMeta(serverUrl, customHeaders, meta);
+  if (action === 'tools/list') {
+    const tools = isSseTransport(serverUrl)
+      ? await mcpListToolsSse(serverUrl, customHeaders || {})
+      : await mcpListTools(serverUrl, customHeaders || {});
+    return jsonResponse({ tools }, 200, cors);
+  }
   const result = isSseTransport(serverUrl)
     ? await mcpCallToolSse(serverUrl, toolName, toolArgs || {}, customHeaders || {})
     : await mcpCallTool(serverUrl, toolName, toolArgs || {}, customHeaders || {});
@@ -854,6 +974,11 @@ export default async function handler(req, ctx) {
   }
 
   const started = Date.now();
+  const proofDenied = checkIpScopedEdgeProof(req, cors);
+  if (proofDenied) {
+    emitProxyUsage(req, proofDenied.status, Date.now() - startedAt, ctx);
+    return proofDenied;
+  }
   const ip = getClientIp(req);
   const meta: ProxyMeta = { targetHost: '', targetPath: '', headerNames: [] };
 
@@ -862,7 +987,7 @@ export default async function handler(req, ctx) {
   // without a Redis round-trip). This endpoint is already premium-auth gated,
   // so Redis-degraded scoped limits intentionally stay availability-first;
   // checkScopedRateLimit logs/Sentry-captures the degraded path.
-  const scoped = await checkScopedRateLimit(RATE_LIMIT_SCOPE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, ip);
+  const scoped = await checkScopedRateLimit(RATE_LIMIT_SCOPE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, rateLimitKeyForIp(ip));
   if (!scoped.allowed) {
     const retryAfter = Math.max(1, Math.ceil((scoped.reset - Date.now()) / 1000));
     logProxyCall({
@@ -898,6 +1023,8 @@ export default async function handler(req, ctx) {
   }
 
   let response: Response;
+  let upstreamStatus: number | null = null;
+  let upstreamRpcCode: number | null = null;
   try {
     if (req.method === 'GET') {
       response = await handleListTools(req, cors, meta);
@@ -913,6 +1040,10 @@ export default async function handler(req, ctx) {
       || err instanceof McpProxyJsonDepthError
       ? err.message : 'MCP proxy request failed';
     const failure = proxyFailureFor(err);
+    if (err instanceof McpProxyUpstreamError) {
+      upstreamStatus = err.upstreamStatus;
+      upstreamRpcCode = err.upstreamRpcCode;
+    }
     // Until now this catch swallowed EVERY handler fault into a 422/422-shaped
     // JSON body with no Sentry event, so a genuine proxy defect was visible
     // only to the caller who hit it. Capture it.
@@ -923,17 +1054,26 @@ export default async function handler(req, ctx) {
     //
     // targetHost is caller-supplied, so it rides in `extra`, never a tag —
     // an attacker-controlled tag value would shred Sentry's tag cardinality.
-    captureSilentError(err, {
-      tags: { route: 'api/mcp-proxy', step: 'proxy-dispatch' },
-      extra: { target_host: meta.targetHost, target_path: meta.targetPath, method: req.method },
-      level: failure.level,
-      ctx,
-    });
+    if (failure.report) {
+      captureSilentError(new Error(failure.isTimeout ? 'MCP server timed out' : msg), {
+        tags: { route: 'api/mcp-proxy', step: 'proxy-dispatch' },
+        fingerprint: ['api/mcp-proxy', 'proxy-dispatch', failure.errorClass],
+        extra: { target_host: meta.targetHost, target_path: meta.targetPath, method: req.method },
+        level: failure.level,
+        ctx,
+      });
+    }
     // Return 422 (not 502) so Cloudflare proxy does not replace our JSON body with its own HTML error page
+    //
+    // The 504 is OUR relay of the remote MCP server's timeout, already captured
+    // above at warning. `X-Wm-Upstream-Timeout` lets premium-fetch's origin-5xx
+    // canary skip it instead of re-reporting it from every browser as an
+    // origin `API 504` error (WORLDMONITOR-17A). Exposed cross-origin via
+    // EXPOSED_HEADERS in api/_cors.js.
     response = jsonResponse(
       { error: failure.isTimeout ? 'MCP server timed out' : msg },
       failure.isTimeout ? 504 : 422,
-      cors,
+      failure.isTimeout ? { ...cors, 'X-Wm-Upstream-Timeout': '1' } : cors,
     );
   }
 
@@ -945,6 +1085,8 @@ export default async function handler(req, ctx) {
     header_names: meta.headerNames,
     status: response.status,
     duration_ms: Date.now() - started,
+    upstream_status: upstreamStatus,
+    upstream_rpc_code: upstreamRpcCode,
   });
   emitProxyUsage(req, response.status, Date.now() - startedAt, ctx, callerIdentity);
 

@@ -68,6 +68,15 @@ describe('scripts/shared/ stays in sync with shared/', () => {
     // U6/U7: pure URL classifier consumed by the brief filter (edge) AND
     // by the audit script under scripts/. Must stay byte-identical.
     'url-classifier.js',
+    // Railway seed-wb-indicators.mjs writes the same v2 keys the Edge RPC reads.
+    'world-bank-rpc-cache.js',
+    // #8867: market-alert detectors and their import graph, consumed by
+    // scripts/seed-market-alert-ledger.mjs (Railway nixpacks-root-scripts).
+    'text-analysis-core.js',
+    'entity-registry.js',
+    'entity-extraction-core.js',
+    'market-alert-core.js',
+    'news-clustering-core.js',
   ]);
   // The attribution manifest is canonical at shared/ and is consumed by
   // repository-rooted build tooling. It is not a scripts-runtime input, so a
@@ -119,6 +128,20 @@ describe('Edge Function no node: built-ins', () => {
         !match,
         `${name}: imports node:${match?.[1]} — Vercel Edge Runtime does not support node: built-in modules. Use an edge-compatible alternative.`,
       );
+    });
+  }
+});
+
+// AGENTS.md: legacy JS entries share code only through `_*.js` helpers or
+// packages. Importing another route entry couples two deployables and bundles
+// the whole sibling handler (#8305 briefly had authorize.js import register.js).
+describe('Legacy JS entries import only _-prefixed relative modules', () => {
+  for (const { name, path } of allEdgeFunctions) {
+    it(`${name} imports no sibling route entry`, () => {
+      const src = readFileSync(path, 'utf-8');
+      const specs = [...src.matchAll(/(?:from|import\()\s*['"](\.[^'"]+)['"]/g)].map((m) => m[1]);
+      const routes = specs.filter((spec) => !spec.split('/').pop().startsWith('_'));
+      assert.deepEqual(routes, [], `${name}: move shared code into a _-prefixed helper`);
     });
   }
 });
@@ -248,13 +271,16 @@ describe('api/slack/oauth/start.ts safety', () => {
 describe('api/slack/oauth/callback.ts safety', () => {
   const callbackPath = join(root, 'api', 'slack', 'oauth', 'callback.ts');
 
-  it("uses '*' as postMessage targetOrigin (works on all WM subdomains and previews)", () => {
+  it('posts the success message only to the opener origin stored with the state', () => {
     const src = readFileSync(callbackPath, 'utf-8');
     assert.ok(
-      src.includes("APP_ORIGIN = '*'"),
-      "callback.ts: postMessage targetOrigin must be '*' so it works on tech/finance/happy subdomains and " +
-      'preview deployments — a hardcoded origin would silently drop messages on all other origins. ' +
-      "Security comes from the e.origin check in the listener, not from targetOrigin.",
+      src.includes('postMessage(${msg},${safeJsonInScript(openerOrigin)})'),
+      'callback.ts: the connected message carries channel and workspace names, so it must target the ' +
+      "opener origin recorded by start (server/_shared/channel-oauth-state.ts), not '*'.",
+    );
+    assert.ok(
+      src.includes("callbackMatchesBrowser('slack', req, oauthState)"),
+      'callback.ts: must refuse a callback from a browser that did not call start',
     );
   });
 

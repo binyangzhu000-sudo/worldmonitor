@@ -652,7 +652,7 @@ describe('OpenAPI examples contract', () => {
       const spec = JSON.parse(readFileSync(resolve(apiDir, file), 'utf8'));
       return sum + operationEntries(spec).length;
     }, 0);
-    assert.equal(total, 230, `expected 230 OpenAPI operations, found ${total}`);
+    assert.equal(total, 241, `expected 241 OpenAPI operations, found ${total}`);
   });
 
   it('adds schema-valid request and response examples to every service JSON spec', () => {
@@ -664,9 +664,9 @@ describe('OpenAPI examples contract', () => {
       totals.requestExpected += result.requestExpected;
       totals.responseExpected += result.responseExpected;
     }
-    assert.equal(totals.operations, 230);
+    assert.equal(totals.operations, 241);
     assert.ok(totals.requestExpected >= 137, `expected at least 137 request example targets, found ${totals.requestExpected}`);
-    assert.equal(totals.responseExpected, 230);
+    assert.equal(totals.responseExpected, 241);
   });
 
   // record-baseline-snapshot's nested updates[].type is a bare string (no schema
@@ -705,14 +705,14 @@ describe('OpenAPI examples contract', () => {
       const spec = loadYaml(readFileSync(resolve(apiDir, yamlFile), 'utf8'));
       operations += assertOperationExamples(spec, yamlFile).operations;
     }
-    assert.equal(operations, 230);
+    assert.equal(operations, 241);
   });
 
   it('adds request and response examples to the unified OpenAPI bundle', () => {
     const bundle = loadUnifiedOpenApiSpec();
     const result = assertOperationExamples(bundle, 'worldmonitor.openapi.yaml');
-    assert.equal(result.operations, 230);
-    assert.equal(result.responseExpected, 230);
+    assert.equal(result.operations, 241);
+    assert.equal(result.responseExpected, 241);
   });
 
   // A honeypot field (hidden anti-bot input) is silently discarded by the
@@ -802,11 +802,54 @@ describe('OpenAPI curated example values', () => {
     }
   });
 
+  it('keeps every probability example inside [0, 1]', () => {
+    const outOfRange = [];
+    const walk = (value, path) => {
+      if (Array.isArray(value)) return value.forEach((item, index) => walk(item, `${path}[${index}]`));
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if (/probability$/i.test(key) && typeof child === 'number' && (child < 0 || child > 1)) outOfRange.push(`${path}.${key}=${child}`);
+        walk(child, `${path}.${key}`);
+      }
+    };
+    for (const file of serviceSpecs) walk(JSON.parse(readFileSync(resolve(apiDir, file), 'utf8')).paths, file);
+    assert.deepEqual(outOfRange, []);
+  });
+
   it('uses an ISO datetime example for webcam lastUpdated', () => {
     const spec = JSON.parse(readFileSync(resolve(apiDir, 'WebcamService.openapi.json'), 'utf8'));
     const example = spec.paths?.['/api/webcam/v1/get-webcam-image']?.get
       ?.responses?.['200']?.content?.[JSON_MEDIA]?.example?.lastUpdated;
     assert.equal(example, '2026-01-15T12:00:00.000Z');
+  });
+
+  it('uses an ISO3 country and a real DTM operation for GetInternalDisplacement', () => {
+    const specs = [
+      ['DisplacementService.openapi.json', JSON.parse(readFileSync(resolve(apiDir, 'DisplacementService.openapi.json'), 'utf8'))],
+      ['DisplacementService.openapi.yaml', loadYaml(readFileSync(resolve(apiDir, 'DisplacementService.openapi.yaml'), 'utf8'))],
+      ['worldmonitor.openapi.yaml', loadUnifiedOpenApiSpec()],
+    ];
+    for (const [label, spec] of specs) {
+      const op = spec.paths?.['/api/displacement/v1/get-internal-displacement']?.get;
+      assert.equal(op?.parameters?.find((p) => p.name === 'country_code')?.example, 'SDN', `${label}: country_code`);
+      const example = op?.responses?.['200']?.content?.[JSON_MEDIA]?.example;
+      assert.equal(example?.operations?.[0]?.countryCode, 'SDN', `${label}: operation country`);
+      assert.equal(example?.operations?.[0]?.regions?.[0]?.pcode, 'SD11', `${label}: region P-code`);
+    }
+  });
+
+  it('uses a published wire id and UTC-midnight epoch for GetUsInterestRates', () => {
+    const specs = [
+      ['EconomicService.openapi.json', JSON.parse(readFileSync(resolve(apiDir, 'EconomicService.openapi.json'), 'utf8'))],
+      ['EconomicService.openapi.yaml', loadYaml(readFileSync(resolve(apiDir, 'EconomicService.openapi.yaml'), 'utf8'))],
+      ['worldmonitor.openapi.yaml', loadUnifiedOpenApiSpec()],
+    ];
+    for (const [label, spec] of specs) {
+      const example = spec.paths?.['/api/economic/v1/get-us-interest-rates']?.get
+        ?.responses?.['200']?.content?.[JSON_MEDIA]?.example;
+      assert.equal(example?.series?.[0]?.id, 'fed_funds_effective', `${label}: series id`);
+      assert.equal(example?.series?.[0]?.points?.[0]?.date, 1717200000000, `${label}: observation date`);
+    }
   });
 
   it('uses accepted LLM providers in SummarizeArticle examples', () => {
@@ -942,6 +985,31 @@ describe('OpenAPI curated example values', () => {
 
     for (const [label, spec] of specs) {
       assertGivingPublishedEstimateExample(spec, label);
+    }
+  });
+
+  // ProductExporter and CountryProductEvidence have no `required` list and more
+  // fields than MAX_OPTIONAL_PROPERTIES, so the alphabetical slot cap decides
+  // what the GetCountryProducts example shows. Volume and recovery bookkeeping
+  // must not push out the fields each object exists for.
+  it('keeps share, value and source in the GetCountryProducts response example', () => {
+    const specs = [
+      ['SupplyChainService.openapi.json', JSON.parse(readFileSync(resolve(apiDir, 'SupplyChainService.openapi.json'), 'utf8'))],
+      ['SupplyChainService.openapi.yaml', loadYaml(readFileSync(resolve(apiDir, 'SupplyChainService.openapi.yaml'), 'utf8'))],
+      ['worldmonitor.openapi.yaml', loadUnifiedOpenApiSpec()],
+    ];
+
+    for (const [label, spec] of specs) {
+      const ops = operationEntries(spec).filter(({ op }) => op.operationId === 'GetCountryProducts');
+      assert.ok(ops.length > 0, `${label}: expected a GetCountryProducts operation`);
+      for (const { path, op } of ops) {
+        const example = op.responses?.['200']?.content?.[JSON_MEDIA]?.example;
+        const exporter = example?.products?.[0]?.topExporters?.[0];
+        for (const key of ['partnerCode', 'share', 'value']) {
+          assert.ok(exporter && Object.hasOwn(exporter, key), `${label} ${path}: topExporters example drops ${key}`);
+        }
+        assert.ok(example?.evidence && Object.hasOwn(example.evidence, 'source'), `${label} ${path}: evidence example drops source`);
+      }
     }
   });
 

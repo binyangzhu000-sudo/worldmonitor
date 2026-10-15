@@ -18,6 +18,12 @@ import {
 } from '../src/config/docs-locale-seo.ts';
 
 const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const ORGANIZATION_AUTHOR = {
+  '@id': 'https://www.worldmonitor.app/#organization',
+  '@type': 'Organization',
+  name: 'World Monitor',
+  url: 'https://www.worldmonitor.app/',
+};
 
 describe('docs locale SEO path gating', () => {
   it('accepts document paths and rejects Mintlify assets', () => {
@@ -239,7 +245,7 @@ describe('docs entity-graph rewrite (#7459d)', () => {
       .find((block) => Array.isArray(block['@graph']))?.['@graph'] as Record<string, unknown>[];
     const article = graph.find((node) => Array.isArray(node['@type']));
     assert.ok(article, 'the Article node must survive the rewrite');
-    assert.deepEqual(article.author, { '@id': 'https://www.worldmonitor.app/#organization' });
+    assert.deepEqual(article.author, ORGANIZATION_AUTHOR);
     assert.deepEqual(article.publisher, { '@id': 'https://www.worldmonitor.app/#organization' });
     assert.equal(article.dateModified, '2026-08-30T00:00:00Z');
     assert.equal(article.datePublished, DOCS_PAGE_DATES.about.datePublished);
@@ -251,7 +257,7 @@ describe('docs entity-graph rewrite (#7459d)', () => {
       .find((block) => Array.isArray(block['@graph']))?.['@graph'] as Record<string, unknown>[];
     assert.deepEqual(
       graph.find((node) => node['@type'] === 'TechArticle')?.author,
-      { '@id': 'https://www.worldmonitor.app/#organization' },
+      ORGANIZATION_AUTHOR,
     );
 
     const byline = articleSeed.replace(
@@ -265,6 +271,121 @@ describe('docs entity-graph rewrite (#7459d)', () => {
       { '@type': 'Person', name: 'A Named Author' },
       'an upstream byline must win over the Organization fallback',
     );
+
+    const stub = articleSeed.replace(
+      '"publisher"',
+      '"author":{"@id":"https://www.worldmonitor.app/#organization"},"publisher"',
+    );
+    const stubGraph = jsonLdBlocks(rewriteDocsLocaleHtml(stub, '/docs/about'))
+      .find((block) => Array.isArray(block['@graph']))?.['@graph'] as Record<string, unknown>[];
+    assert.deepEqual(
+      stubGraph.find((node) => Array.isArray(node['@type']))?.author,
+      ORGANIZATION_AUTHOR,
+      'a bare Organization author stub must be expanded on the first rewrite',
+    );
+  });
+
+  // #7980: the methodology family is editorial judgment a named human owns —
+  // weights chosen, thresholds set, limitations written — and each page renders
+  // a maintainer byline saying so. Organization is the honest author everywhere
+  // the docs are generated or unbylined product documentation; Person is the
+  // honest author here, and it is the Expertise signal the scored pages lean on.
+  // #7980: the methodology family is editorial judgment a named human owns —
+  // weights chosen, thresholds set, limitations written — and each page renders
+  // a maintainer byline saying so. Organization is the honest author everywhere
+  // the docs are generated or unbylined product documentation; Person is the
+  // honest author here, and it is the Expertise signal the scored pages lean on.
+  const PERSON = {
+    '@id': 'https://www.worldmonitor.app/blog/authors/elie-habib/#person',
+    '@type': 'Person',
+    name: 'Elie Habib',
+  };
+  const ORGANIZATION = { '@id': 'https://www.worldmonitor.app/#organization' };
+
+  // Attribution keys on the PATHNAME, so vary only that. An earlier version of
+  // this test also rewrote the seed's `@id` per pathname, which quietly implied
+  // the node's own identity drives the choice and left the test unable to tell
+  // the two implementations apart.
+  const authorFor = (pathname: string, seed = articleSeed) => {
+    const graph = jsonLdBlocks(rewriteDocsLocaleHtml(seed, pathname))
+      .find((block) => Array.isArray(block['@graph']))?.['@graph'] as Record<string, unknown>[];
+    return graph.find((node) => Array.isArray(node['@type']))?.author;
+  };
+
+  it('attributes the methodology family to the canonical Person (#7980)', () => {
+    for (const pathname of ['/docs/methodology/cii-risk-scores', '/docs/methodology/chokepoints']) {
+      assert.deepEqual(authorFor(pathname), PERSON, pathname);
+    }
+    // The Chinese mirror is the same editorial work under a locale prefix.
+    assert.deepEqual(authorFor('/docs/zh/methodology/cii-risk-scores'), PERSON);
+    // Everything outside the family keeps the Organization attribution, including
+    // the near-misses a bare prefix match would swallow.
+    for (const pathname of [
+      '/docs/about',
+      '/docs/getting-started',
+      '/docs/corrections',
+      '/docs/methodology-overview',
+      '/docs/api-reference/methodology/foo',
+    ]) {
+      assert.deepEqual(authorFor(pathname), ORGANIZATION_AUTHOR, pathname);
+    }
+  });
+
+  it('keeps a self-describing Organization author across a second rewrite (#8073)', () => {
+    const html = rewriteDocsLocaleHtml(articleSeed, '/docs/about');
+    assert.deepEqual(authorFor('/docs/about', html), ORGANIZATION_AUTHOR);
+    assert.equal(rewriteDocsLocaleHtml(html, '/docs/about'), html, 'rewriting is idempotent');
+  });
+
+  // Live Mintlify ships a bare WebPage with no Article at all, so INJECTION —
+  // not the attribute-an-existing-Article path above — is what production
+  // actually exercises. Without this case, reverting the injected Article's
+  // author to Organization leaves every other guard in this file green.
+  it('attributes an INJECTED methodology Article to the Person (#7980)', () => {
+    const barePage = `<!DOCTYPE html><html lang="en"><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"CII Risk Scoring Methodology","url":"https://www.worldmonitor.app/docs/methodology/cii-risk-scores"}</script>
+</head><body></body></html>`;
+
+    const injected = jsonLdBlocks(rewriteDocsLocaleHtml(barePage, '/docs/methodology/cii-risk-scores'))
+      .flatMap((block) => (Array.isArray(block['@graph']) ? block['@graph'] : [block])) as Record<string, unknown>[];
+    const article = injected.find((node) => Array.isArray(node['@type']));
+    assert.ok(article, 'the bare WebPage must gain an injected Article');
+    assert.deepEqual(article.author, PERSON, 'an injected methodology Article must carry the Person');
+    assert.deepEqual(article.publisher, ORGANIZATION, 'the publisher stays the Organization');
+
+    // Same injection path, outside the family, still attributes to the Organization.
+    const bareAbout = barePage.replace(/methodology\/cii-risk-scores/g, 'about');
+    const aboutGraph = jsonLdBlocks(rewriteDocsLocaleHtml(bareAbout, '/docs/about'))
+      .flatMap((block) => (Array.isArray(block['@graph']) ? block['@graph'] : [block])) as Record<string, unknown>[];
+    assert.deepEqual(
+      aboutGraph.find((node) => Array.isArray(node['@type']))?.author,
+      ORGANIZATION_AUTHOR,
+    );
+  });
+
+  // The schema claim and the rendered claim must not drift apart. Attribution
+  // keys on a slug prefix, so a new methodology page added without the byline
+  // would silently claim a named human wrote it — the one dishonest outcome
+  // this attribution must never produce.
+  it('names the maintainer on every page it attributes to the Person (#7980)', () => {
+    const families = [
+      { dir: 'docs/methodology', prefix: '/docs/methodology', byline: 'Methodology maintained by [Elie Habib]' },
+      { dir: 'docs/zh/methodology', prefix: '/docs/zh/methodology', byline: '本方法论由 World Monitor 创始人 [Elie Habib]' },
+    ];
+    let checked = 0;
+    for (const { dir, prefix, byline } of families) {
+      const pages = readdirSync(new URL(`../${dir}`, import.meta.url))
+        .filter((name) => name.endsWith('.mdx'));
+      assert.ok(pages.length > 15, `${dir}: expected the published methodology family, saw ${pages.length}`);
+      for (const page of pages) {
+        checked += 1;
+        const slug = page.replace(/\.mdx$/, '');
+        const source = readFileSync(new URL(`../${dir}/${page}`, import.meta.url), 'utf8');
+        assert.ok(source.includes(byline), `${dir}/${page} is attributed to a person but names no maintainer`);
+        assert.deepEqual(authorFor(`${prefix}/${slug}`), PERSON, `${dir}/${page}`);
+      }
+    }
+    assert.ok(checked > 40, `expected both mirrors of the family, checked ${checked}`);
   });
 
   it('does not attribute a non-Article node', () => {
@@ -405,7 +526,7 @@ describe('docs article injection for bare WebPage output', () => {
     assert.ok(article, 'a bare WebPage must gain an Article node');
     assert.equal(article?.dateModified, DOCS_PAGE_DATES['architecture'].dateModified);
     assert.deepEqual(article?.publisher, { '@id': ORG_ID });
-    assert.deepEqual(article?.author, { '@id': ORG_ID });
+    assert.deepEqual(article?.author, ORGANIZATION_AUTHOR);
     assert.equal(article?.datePublished, DOCS_PAGE_DATES['architecture'].datePublished);
   });
 
@@ -435,7 +556,7 @@ describe('docs article injection for bare WebPage output', () => {
     assert.ok(article, 'the upstream Article must survive');
     assert.equal(article?.dateModified, DOCS_PAGE_DATES['about'].dateModified);
     assert.equal(article?.datePublished, DOCS_PAGE_DATES['about'].datePublished);
-    assert.deepEqual(article?.author, { '@id': ORG_ID });
+    assert.deepEqual(article?.author, ORGANIZATION_AUTHOR);
   });
 
   it('preserves upstream dates and leaves unknown slugs untouched', () => {
@@ -477,7 +598,7 @@ describe('docs article injection for bare WebPage output', () => {
     assert.equal(articles.length, 1, 'the complete document must contain at most one Article');
     assert.equal(articles[0]?.dateModified, DOCS_PAGE_DATES.about.dateModified);
     assert.equal(articles[0]?.datePublished, DOCS_PAGE_DATES.about.datePublished);
-    assert.deepEqual(articles[0]?.author, { '@id': ORG_ID });
+    assert.deepEqual(articles[0]?.author, ORGANIZATION_AUTHOR);
     assert.deepEqual(
       nodes.find((node) => node['@type'] === 'WebPage')?.speakable,
       { '@type': 'SpeakableSpecification', cssSelector: ['h1'] },

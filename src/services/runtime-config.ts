@@ -3,7 +3,6 @@ import { safeStorageSet } from '@/utils/safe-storage';
 import { invokeTauri } from './tauri-bridge';
 
 export type RuntimeSecretKey =
-  | 'GROQ_API_KEY'
   | 'ATLASCLOUD_API_KEY'
   | 'OPENROUTER_API_KEY'
   | 'EXA_API_KEYS'
@@ -33,7 +32,6 @@ export type RuntimeSecretKey =
   | 'ICAO_API_KEY';
 
 export type RuntimeFeatureId =
-  | 'aiGroq'
   | 'aiAtlasCloud'
   | 'aiOpenRouter'
   | 'stockNewsSearchExa'
@@ -84,7 +82,6 @@ export interface RuntimeConfig {
 const TOGGLES_STORAGE_KEY = 'worldmonitor-runtime-feature-toggles';
 
 const defaultToggles: Record<RuntimeFeatureId, boolean> = {
-  aiGroq: true,
   aiAtlasCloud: true,
   aiOpenRouter: true,
   stockNewsSearchExa: true,
@@ -118,27 +115,20 @@ export const RUNTIME_FEATURES: RuntimeFeatureDefinition[] = [
     name: 'Ollama local summarization',
     description: 'Local LLM provider via OpenAI-compatible endpoint (Ollama or LM Studio, desktop-first).',
     requiredSecrets: ['OLLAMA_API_URL', 'OLLAMA_MODEL'],
-    fallback: 'Falls back to Atlas Cloud, OpenRouter, Groq, then local browser model.',
+    fallback: 'Falls back to Atlas Cloud, OpenRouter, then local browser model.',
   },
   {
     id: 'aiAtlasCloud',
     name: 'Atlas Cloud summarization',
     description: 'OpenAI-compatible LLM provider via Atlas Cloud unified model API.',
     requiredSecrets: ['ATLASCLOUD_API_KEY'],
-    fallback: 'Falls back to OpenRouter, Groq, then local browser model.',
+    fallback: 'Falls back to OpenRouter, then local browser model.',
   },
   {
     id: 'aiOpenRouter',
     name: 'OpenRouter summarization',
-    description: 'Secondary LLM provider for AI summary fallback.',
+    description: 'Hosted LLM provider used for AI summary generation.',
     requiredSecrets: ['OPENROUTER_API_KEY'],
-    fallback: 'Falls back to Groq, then local browser model.',
-  },
-  {
-    id: 'aiGroq',
-    name: 'Groq summarization',
-    description: 'Fast LLM provider used as a later fallback for AI summary generation.',
-    requiredSecrets: ['GROQ_API_KEY'],
     fallback: 'Falls back to local browser model only.',
   },
   {

@@ -1,7 +1,6 @@
 import type { RuntimeSecretKey, RuntimeFeatureId } from './runtime-config';
 
 export const SIGNUP_URLS: Partial<Record<RuntimeSecretKey, string>> = {
-  GROQ_API_KEY: 'https://console.groq.com/keys',
   ATLASCLOUD_API_KEY: 'https://www.atlascloud.ai/console/api-keys',
   OPENROUTER_API_KEY: 'https://openrouter.ai/settings/keys',
   EXA_API_KEYS: 'https://dashboard.exa.ai/api-keys',
@@ -38,7 +37,6 @@ export const PLAINTEXT_KEYS = new Set<RuntimeSecretKey>([
 export const MASKED_SENTINEL = '__WM_MASKED__';
 
 export const HUMAN_LABELS: Record<RuntimeSecretKey, string> = {
-  GROQ_API_KEY: 'Groq API Key',
   ATLASCLOUD_API_KEY: 'Atlas Cloud API Key',
   OPENROUTER_API_KEY: 'OpenRouter API Key',
   EXA_API_KEYS: 'Exa API Keys',
@@ -78,7 +76,7 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
   {
     id: 'ai',
     label: 'AI & Summarization',
-    features: ['aiOllama', 'aiAtlasCloud', 'aiGroq', 'aiOpenRouter'],
+    features: ['aiOllama', 'aiAtlasCloud', 'aiOpenRouter'],
   },
   {
     id: 'economy',

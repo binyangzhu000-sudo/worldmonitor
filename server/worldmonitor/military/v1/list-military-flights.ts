@@ -9,6 +9,7 @@ import type {
 
 import { isMilitaryCallsign, isMilitaryHex, detectAircraftType, UPSTREAM_TIMEOUT_MS } from './_shared';
 import { hasFiniteRequestBounds, normalizeBounds, type RequestBounds } from './_bounds';
+import { MILITARY_FLIGHTS_SEED_KEY, MILITARY_FLIGHTS_STALE_KEY } from './_tracked-aircraft';
 import { cachedFetchJson, getRawJson, readCachedJson, setCachedJson, setCachedJsonIfAbsent } from '../../../_shared/redis';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 import { getRelayBaseUrl, getRelayHeaders } from '../../../_shared/relay';
@@ -19,9 +20,9 @@ import {
 // @ts-expect-error JavaScript module has no declaration file.
 import { captureSilentError } from '../../../../api/_sentry-edge.js';
 
-const REDIS_CACHE_KEY = 'military:flights:v1';
+const REDIS_CACHE_KEY = MILITARY_FLIGHTS_SEED_KEY;
 const REDIS_CACHE_TTL = 600; // 10 min — reduce upstream API pressure
-const REDIS_STALE_KEY = 'military:flights:stale:v1';
+const REDIS_STALE_KEY = MILITARY_FLIGHTS_STALE_KEY;
 const STABLE_LIVE_SNAPSHOT_CACHE_KEY = 'military:flights:stable-live:v1';
 const STABLE_STALE_CACHE_KEY = 'military:flights:stable-stale:v1';
 const STALE_SNAPSHOT_CACHE_TTL = 120; // Bind a bounded cursor traversal to one snapshot.
@@ -109,7 +110,9 @@ function buildCacheKey(req: ListMilitaryFlightsRequest): string {
     quantize(req.neLat, BBOX_GRID_STEP),
     quantize(req.neLon, BBOX_GRID_STEP),
   ].join(':');
-  return `${REDIS_CACHE_KEY}:${quantizedBB}:${req.operator || ''}:${req.aircraftType || ''}`;
+  // These accepted public fields are currently no-ops, so they cannot split
+  // the shared recovery snapshot until response filtering is implemented.
+  return `${REDIS_CACHE_KEY}:${quantizedBB}`;
 }
 
 // Filter the cached quantized-cell snapshot to the exact request bbox, THEN

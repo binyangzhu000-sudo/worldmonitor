@@ -318,11 +318,14 @@ paths:
                         - 'satellite_fires'
                 - name: region
                   in: query
-                  description: Geographic region key, defaults to "global".
+                  description: Only the global baseline is defined. Omitted or empty defaults to global.
                   required: false
-                  example: "example"
+                  example: "global"
                   schema:
                     type: string
+                    enum:
+                        - 'global'
+                        - ''
                 - name: count
                   in: query
                   description: Current observed count to compare against baseline.
@@ -688,14 +691,17 @@ paths:
             parameters:
                 - name: tier
                   in: query
-                  description: Predefined tiers or specific keys.
+                  description: 'Fixed public tier: fast or slow. Leave empty when selecting a key.'
                   required: false
-                  example: "example"
+                  example: "fast"
                   schema:
                     type: string
+                    pattern: '^(fast|slow)$'
                 - name: keys
                   in: query
-                  description: Specific bootstrap cache keys to fetch when tier is not sufficient.
+                  description: |-
+                    Registered bootstrap keys, for example insights. Repeat the parameter for
+                     several fast/slow keys. Omit when using tier.
                   required: false
                   style: form
                   explode: true
@@ -703,8 +709,10 @@ paths:
                       - "example"
                   schema:
                     type: array
+                    maxItems: 100
                     items:
-                        type: string
+                      type: string
+                      minLength: 1
                 - name: jmespath
                   in: query
                   description: |-
@@ -1378,7 +1386,7 @@ paths:
                                 "anomalies":
                                     - "asn": "example"
                                       "asnName": "WorldMonitor Analyst"
-                                      "endDate": 1
+                                      "endDate": 1717200000000
                                       "latitude": 40.7128
                                       "locationCode": "US"
                                 "totalCount": 1
@@ -1795,7 +1803,10 @@ components:
                     description: 'Activity type: "military_flights", "vessels", "protests", "news", "ais_gaps", "satellite_fires".'
                 region:
                     type: string
-                    description: Geographic region key, defaults to "global".
+                    description: Only the global baseline is defined. Omitted or empty defaults to global.
+                    enum:
+                        - 'global'
+                        - ''
                 count:
                     type: number
                     format: double
@@ -1904,13 +1915,23 @@ components:
             properties:
                 tier:
                     type: string
-                    description: Predefined tiers or specific keys.
+                    pattern: ^(fast|slow)$
+                    description: 'Fixed public tier: fast or slow. Leave empty when selecting a key.'
                 keys:
                     type: array
                     items:
                         type: string
-                        description: Specific bootstrap cache keys to fetch when tier is not sufficient.
-            description: GetBootstrapDataRequest parameters for multi-key fetching.
+                        maxItems: 100
+                        description: |-
+                            Registered bootstrap keys, for example insights. Repeat the parameter for
+                             several fast/slow keys. Omit when using tier.
+                    maxItems: 100
+            description: |-
+                GetBootstrapDataRequest selects a fixed tier or registered bootstrap keys.
+                 Exactly one selector is required: use tier OR keys, never both.
+                 Several keys are accepted when every key belongs to the fast or slow tier;
+                 an on-demand key must be requested alone. Empty, unknown and mixed
+                 selectors return HTTP 400.
         GetBootstrapDataResponse:
             type: object
             properties:

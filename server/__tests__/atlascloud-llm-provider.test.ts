@@ -26,6 +26,8 @@ describe("Atlas Cloud LLM provider credentials", () => {
 
   test("builds OpenAI-compatible chat credentials with the default model", () => {
     process.env.ATLASCLOUD_API_KEY = "test-atlas-key";
+    delete process.env.ATLASCLOUD_API_BASE;
+    delete process.env.ATLASCLOUD_MODEL;
 
     const credentials = getProviderCredentials("atlascloud");
 
